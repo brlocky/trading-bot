@@ -1,0 +1,29 @@
+Start                         2025-09-24 16:30:00
+End                           2025-10-05 02:15:00
+Period                           10 days 10:00:00
+Start Value                              100000.0
+End Value                                100000.0
+Total Return [%]                              0.0
+Benchmark Return [%]                      7.97209
+Max Gross Exposure [%]                        0.0
+Total Fees Paid                               0.0
+Max Drawdown [%]                              NaN
+Max Drawdown Duration                         NaT
+Total Trades                                    0
+Total Closed Trades                             0
+Total Open Trades                               0
+Open Trade PnL                                0.0
+Win Rate [%]                                  NaN
+Best Trade [%]                                NaN
+Worst Trade [%]                               NaN
+Avg Winning Trade [%]                         NaN
+Avg Losing Trade [%]                          NaN
+Avg Winning Trade Duration                    NaT
+Avg Losing Trade Duration                     NaT
+Profit Factor                                 NaN
+Expectancy                                    NaN
+Sharpe Ratio                                  inf
+Calmar Ratio                                  NaN
+Omega Ratio                                   inf
+Sortino Ratio                                 inf
+dtype: object

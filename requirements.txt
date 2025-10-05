@@ -1,6 +1,7 @@
 altgraph==0.17.4
 annotated-types==0.7.0
 anyio==4.10.0
+anywidget==0.9.18
 asgiref==3.9.1
 asttokens==3.0.0
 autopep8==2.3.2
@@ -70,6 +71,7 @@ plotly==6.3.0
 prompt_toolkit==3.0.52
 protobuf==6.32.1
 proxy_tools==0.1.0
+psygnal==0.14.2
 pure_eval==0.2.3
 pycodestyle==2.14.0
 pycparser==2.22
@@ -91,6 +93,7 @@ pywin32-ctypes==0.2.3
 PyYAML==6.0.2
 regex==2025.9.18
 requests==2.32.3
+ruff==0.13.3
 schedule==1.2.2
 scikit-learn==1.7.2
 scipy==1.16.2
