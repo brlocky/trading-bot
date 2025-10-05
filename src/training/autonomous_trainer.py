@@ -1,14 +1,5 @@
 """
-🚀 AUTONOMOUS TRADER TRAINER - Level-Based Trading Model Training
-================================================================
-Trains models for autonomous trading decisions based on multi-timeframe
-technical analysis and price interaction with key support/resistance levels.
-
-Training Approach:
-1. Historical market simulation with level extraction
-2. Label generation based on profitable price movements
-3. Classification models for trading actions (buy/sell/hold)
-4. Backtesting and validation
+Autonomous Trader Trainer - Trains models for autonomous trading decisions
 """
 
 import pandas as pd
@@ -21,17 +12,17 @@ from typing import Dict, Tuple
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
 import xgboost as xgb
 import time
 
-from src.autonomous_trader import (
-    AutonomousTrader, MultitimeframeLevelExtractor,
-    LevelBasedFeatureEngineer, TradingAction
-)
+from src.core.trading_types import TradingAction
+from src.extraction.level_extractor import MultitimeframeLevelExtractor
+from src.extraction.feature_engineer import LevelBasedFeatureEngineer
+from src.trading.autonomous_trader import AutonomousTrader
 from src.indicator_utils import add_progressive_indicators
 
 warnings.filterwarnings('ignore')
@@ -119,7 +110,11 @@ class AutonomousTraderTrainer:
 
             # Progress reporting
             if (i + 1) % 1000 == 0:
-                print(f"   Processed {i + 1}/{len(intraday_df) - max_lookforward} candles")
+                progress_pct = (i + 1) / (len(intraday_df) - max_lookforward) * 100
+                import threading
+                thread_id = threading.current_thread().ident
+                print(f"   📈 Processing: {i + 1:,}/{len(intraday_df) - max_lookforward:,} candles " +
+                      f"({progress_pct:.1f}%) [T:{thread_id}]", flush=True)
 
         # Convert to DataFrame
         features_df = pd.DataFrame(features_list)
@@ -357,7 +352,7 @@ class AutonomousTraderTrainer:
             models_to_try['xgboost_cpu'] = xgb.XGBClassifier(
                 n_estimators=200, max_depth=8, learning_rate=0.1,
                 random_state=random_state, tree_method='hist',
-                n_jobs=-1, eval_metric='mlogloss'
+                n_jobs=4, eval_metric='mlogloss'
             )
 
             best_model = None

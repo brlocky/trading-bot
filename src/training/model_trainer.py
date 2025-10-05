@@ -1,33 +1,21 @@
 """
-🚀 SIMPLE MODEL TRAINER - Clean and Reusable Training System
-===========================================================
-Handles all the complexity of model training, data preparation, and predictions
-for the Simple_Model_Debug.ipynb notebook.
-
-This class encapsulates:
-- Data preparation and cleaning
-- Label processing and encoding
-- GPU model training (with CPU fallback)
-- Model saving/loading
-- Feature engineering for predictions
-- Prediction generation with confidence scores
+Simple Model Trainer - Main training interface for the trading system
 """
 
 import pandas as pd
 import numpy as np
-import json
 import os
 import joblib
 import time
 from typing import Dict, List, Tuple, Optional, Any
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
 from sklearn.preprocessing import LabelEncoder
 import xgboost as xgb
 import warnings
 
-from src.autonomous_trader_trainer import AutonomousTraderTrainer
-from src.autonomous_trader import AutonomousTrader
+from src.training.autonomous_trainer import AutonomousTraderTrainer
+from src.memory.trade_memory import TradeMemoryManager
+from src.detection.bounce_detector import BounceDetector
 
 warnings.filterwarnings('ignore')
 
@@ -48,6 +36,12 @@ class SimpleModelTrainer:
         self.lookforward_periods = [5, 10, 20]
         self.model_path = 'src/models/simple_trading_model.joblib'
 
+        # Memory and bounce detection systems
+        self.trade_memory = TradeMemoryManager()
+        self.bounce_detector = BounceDetector()
+        self.enable_memory_features = True
+        self.enable_bounce_detection = True
+
     def configure_training(self, profit_threshold: float = 2.0,
                            loss_threshold: float = -1.5,
                            lookforward_periods: List[int] = [5, 10, 20]):
@@ -63,10 +57,10 @@ class SimpleModelTrainer:
 
     def _prepare_training_data(self, main_file: str, level_files: Dict[str, str]) -> Tuple[Optional[pd.DataFrame], Optional[List[str]]]:
         """Prepare and clean training data"""
-        print("📊 Preparing training data...")
+        print("📊 Preparing training data (optimized processing)...")
 
         try:
-            # Get raw features and labels
+            # Get raw features and labels with parallel processing
             features_df, labels_dict = self.trainer.prepare_training_data(main_file, level_files)
 
             if features_df is None or len(features_df) == 0:
@@ -74,6 +68,11 @@ class SimpleModelTrainer:
                 return None, None
 
             print(f"✅ Training data ready: {len(features_df)} samples, {len(features_df.columns)} features")
+
+            # ADD MEMORY-ENHANCED FEATURES
+            if self.enable_memory_features:
+                features_df = self._add_memory_features(features_df)
+                print(f"🧠 Memory features added: {len(features_df.columns)} total features")
 
             # Clean NaN values
             total_nans = features_df.isnull().sum().sum()
@@ -113,46 +112,92 @@ class SimpleModelTrainer:
             print(f"❌ Data preparation error: {e}")
             return None, None
 
+    def _add_memory_features(self, features_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        ADD MEMORY-ENHANCED FEATURES
+        Add trade memory and market context features to improve predictions
+        """
+        print("🧠 Adding memory-enhanced features...")
+
+        # Get current trade memory stats
+        recent_perf = self.trade_memory.get_recent_performance()
+        bounce_perf = self.trade_memory.get_bounce_performance()
+        consecutive = self.trade_memory.get_consecutive_performance()
+
+        num_samples = len(features_df)
+
+        # Memory features (same for all samples during training)
+        memory_features = pd.DataFrame({
+            # Recent performance memory
+            'memory_win_rate': [recent_perf['win_rate']] * num_samples,
+            'memory_avg_pnl': [recent_perf['avg_pnl']] * num_samples,
+            'memory_total_trades': [recent_perf['total_trades']] * num_samples,
+
+            # Bounce-specific memory
+            'bounce_win_rate': [bounce_perf['bounce_win_rate']] * num_samples,
+            'bounce_avg_pnl': [bounce_perf['bounce_avg_pnl']] * num_samples,
+            'bounce_trade_count': [bounce_perf['bounce_trades']] * num_samples,
+
+            # Consecutive performance
+            'consecutive_wins': [max(0, consecutive)] * num_samples,
+            'consecutive_losses': [max(0, -consecutive)] * num_samples,
+
+            # Market context features (simulated for training, real for testing)
+            'market_volatility_regime': np.random.uniform(0.1, 2.0, num_samples),
+            'trend_strength': np.random.uniform(-1.0, 1.0, num_samples),
+        })
+
+        # Combine with existing features
+        enhanced_features = pd.concat([features_df, memory_features], axis=1)
+
+        print(f"   ✅ Added {len(memory_features.columns)} memory features")
+        print(f"   📊 Win Rate: {recent_perf['win_rate']:.1%} | Avg PnL: {recent_perf['avg_pnl']:.2f}%")
+        print(f"   🎯 Bounce Win Rate: {bounce_perf['bounce_win_rate']:.1%}")
+        print(f"   🔥 Consecutive: {consecutive} {'wins' if consecutive > 0 else 'losses' if consecutive < 0 else 'neutral'}")
+
+        return enhanced_features
+
     def _detect_gpu(self) -> bool:
         """Detect if GPU is available"""
         try:
             import subprocess
             result = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
             return result.returncode == 0
-        except:
+        except Exception:
             return False
 
-    def _train_model(self, X_train: pd.DataFrame, X_test: pd.DataFrame, 
-                    y_train_encoded: np.ndarray, y_test_encoded: np.ndarray) -> Tuple[Any, str, Dict]:
+    def _train_model(self, X_train: pd.DataFrame, X_test: pd.DataFrame,
+                     y_train_encoded: np.ndarray, y_test_encoded: np.ndarray) -> Tuple[Any, str, Dict]:
         """Train model with GPU only - no CPU fallback"""
         gpu_available = self._detect_gpu()
         print(f"🖥️  GPU Detection: {'✅ Available' if gpu_available else '❌ Not Available'}")
-        
+
         if not gpu_available:
             raise RuntimeError("❌ GPU not available! Training requires GPU. Please ensure NVIDIA GPU and drivers are properly installed.")
-        
+
         results = {'training_time': None, 'device': 'GPU'}
-        
-        print("   � Training with GPU...")
+
+        print("   🚀 Training with GPU...")
         start_time = time.time()
-        
+
+        # OPTIMIZED THREADING: Using 8 threads for 8-core system
         model = xgb.XGBClassifier(
             n_estimators=200, max_depth=8, learning_rate=0.1,
             random_state=42, tree_method='gpu_hist', gpu_id=0,
-            eval_metric='mlogloss'
+            eval_metric='mlogloss', nthread=8
         )
-        
+
         model.fit(X_train, y_train_encoded)
         training_time = time.time() - start_time
-        
+
         accuracy = model.score(X_test, y_test_encoded)
         print(f"     ✅ GPU Training Complete: {training_time:.2f}s | Accuracy: {accuracy:.1%}")
-        
+
         results['training_time'] = training_time
         model_type = "XGBoost-GPU"
-        
+
         return model, model_type, results
-    
+
     def train_model(self, training_files: Dict[str, str], level_timeframes: List[str] = ['M', 'W', 'D', '1h']) -> bool:
         """Train the model with the given files"""
         print("🎓 TRAINING MODEL")
@@ -248,154 +293,3 @@ class SimpleModelTrainer:
             'features': len(self.model_data.get('feature_columns', [])),
             'classes': self.model_data.get('label_classes', [])
         }
-
-
-class SimpleModelPredictor:
-    """
-    Simple prediction system for testing trained models
-    """
-
-    def __init__(self, model_trainer: SimpleModelTrainer):
-        self.model_trainer = model_trainer
-        self.trader = AutonomousTrader()
-
-    def _load_json_data(self, file_path: str) -> Optional[pd.DataFrame]:
-        """Load JSON data and convert to DataFrame"""
-        try:
-            with open(file_path, 'r') as f:
-                data = json.load(f)
-
-            df = pd.DataFrame(data['candles'])
-            df['datetime'] = pd.to_datetime(df['time'], unit='s')
-
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-
-            return df.sort_values('datetime').reset_index(drop=True)
-        except Exception as e:
-            print(f"Error loading {file_path}: {e}")
-            return None
-
-    def _get_symbol_files(self, symbol: str, data_folder: str = 'data_test') -> Dict[str, str]:
-        """Get available files for a symbol"""
-        files = {}
-        for tf in ['15m', '1h', 'D', 'W', 'M']:
-            path = f'{data_folder}/{symbol}-{tf}.json'
-            if os.path.exists(path):
-                files[tf] = path
-                continue
-            alt_path = f'{data_folder}/{symbol}-{tf} (1).json'
-            if os.path.exists(alt_path):
-                files[tf] = alt_path
-        return files
-
-    def generate_predictions(self, symbol: str, num_candles: int = 200,
-                             data_folder: str = 'data_test') -> Optional[pd.DataFrame]:
-        """Generate predictions for a symbol"""
-        if not self.model_trainer.is_trained:
-            print("❌ No trained model loaded!")
-            return None
-
-        print(f"🎯 Generating predictions for {symbol}")
-
-        # Get test files
-        test_files = self._get_symbol_files(symbol, data_folder)
-        if not test_files:
-            print(f"❌ No data files found for {symbol}")
-            return None
-
-        print(f"📁 Found files: {list(test_files.keys())}")
-
-        # Load main data (prefer 15m, fallback to 1h)
-        main_timeframe = '15m' if '15m' in test_files else '1h'
-        test_data = self._load_json_data(test_files[main_timeframe])
-
-        if test_data is None:
-            print("❌ Could not load test data")
-            return None
-
-        print(f"✅ Loaded {len(test_data)} candles ({main_timeframe})")
-
-        # Extract levels
-        level_files = {tf: path for tf, path in test_files.items() if tf in ['M', 'W', 'D']}
-        if not level_files:
-            print("❌ No level files found")
-            return None
-
-        success = self.trader.update_levels(level_files, force_update=True)
-        if not success:
-            print("❌ Level extraction failed")
-            return None
-
-        total_levels = sum(len(levels) for levels in self.trader.current_levels.values())
-        print(f"✅ Extracted {total_levels} levels")
-
-        # Get recent data for predictions
-        recent_data = test_data.tail(num_candles).copy()
-        print(f"🔍 Processing {len(recent_data)} recent candles")
-
-        # Generate predictions
-        signals = []
-        model_data = self.model_trainer.model_data
-        trained_model = model_data['model']
-        label_encoder = model_data['label_encoder']
-        feature_columns = model_data['feature_columns']
-        model_type = model_data['model_type']
-
-        for i, (_, row) in enumerate(recent_data.iterrows()):
-            try:
-                if i % 50 == 0:
-                    print(f"   Processing {i+1}/{len(recent_data)}...")
-
-                # Create features
-                features = self.trader.feature_engineer.create_level_features(
-                    float(row['close']), float(row['volume']), self.trader.current_levels
-                )
-
-                # Convert to DataFrame and ensure all required features
-                feature_df = pd.DataFrame([features])
-                for col in feature_columns:
-                    if col not in feature_df.columns:
-                        feature_df[col] = 0.0
-
-                feature_df = feature_df[feature_columns]
-
-                # Make prediction
-                prediction_encoded = trained_model.predict(feature_df)[0]
-                confidence = trained_model.predict_proba(feature_df).max()
-                prediction = label_encoder.inverse_transform([prediction_encoded])[0]
-
-                signals.append({
-                    'datetime': row['datetime'],
-                    'close': row['close'],
-                    'high': row['high'],
-                    'low': row['low'],
-                    'open': row['open'] if pd.notna(row['open']) else row['close'],
-                    'volume': row['volume'],
-                    'action': prediction,
-                    'confidence': confidence,
-                    'reasoning': f'{model_type} ({main_timeframe}): {prediction} ({confidence:.1%})'
-                })
-
-            except Exception as e:
-                print(f"   Error processing candle {i}: {e}")
-                continue
-
-        if not signals:
-            print("❌ No predictions generated")
-            return None
-
-        signals_df = pd.DataFrame(signals)
-
-        # Summary
-        action_counts = signals_df['action'].value_counts()
-        print(f"\n📊 PREDICTION RESULTS:")
-        for action, count in action_counts.items():
-            pct = count / len(signals_df) * 100
-            print(f"   {action.upper()}: {count} ({pct:.1f}%)")
-
-        avg_conf = signals_df['confidence'].mean()
-        print(f"   Average Confidence: {avg_conf:.1%}")
-
-        return signals_df
