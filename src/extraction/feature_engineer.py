@@ -5,8 +5,7 @@ Level-Based Feature Engineering - Creates features from price-level interactions
 import numpy as np
 from typing import Dict, List
 
-from src.core.trading_types import LevelInfo
-from src.ta.technical_analysis import ChartInterval
+from core.trading_types import ChartInterval, LevelInfo
 
 
 class LevelBasedFeatureEngineer:
@@ -117,8 +116,8 @@ class LevelBasedFeatureEngineer:
         """Create features representing support/resistance balance"""
         features = {}
 
-        support_levels = [l for l in levels if l.price < current_price]
-        resistance_levels = [l for l in levels if l.price > current_price]
+        support_levels = [level for level in levels if level.price < current_price]
+        resistance_levels = [level for level in levels if level.price > current_price]
 
         features['support_count'] = len(support_levels)
         features['resistance_count'] = len(resistance_levels)
@@ -127,8 +126,8 @@ class LevelBasedFeatureEngineer:
         )
 
         # Weighted strength balance
-        support_strength = sum(l.strength / max(l.distance, 0.1) for l in support_levels)
-        resistance_strength = sum(l.strength / max(l.distance, 0.1) for l in resistance_levels)
+        support_strength = sum(level.strength / max(level.distance, 0.1) for level in support_levels)
+        resistance_strength = sum(level.strength / max(level.distance, 0.1) for level in resistance_levels)
 
         features['weighted_support_strength'] = support_strength
         features['weighted_resistance_strength'] = resistance_strength
@@ -147,7 +146,7 @@ class LevelBasedFeatureEngineer:
         for timeframe, weight in timeframe_weights.items():
             if timeframe in levels:
                 count = len(levels[timeframe])
-                avg_strength = np.mean([l.strength for l in levels[timeframe]]) if levels[timeframe] else 0.0
+                avg_strength = np.mean([level.strength for level in levels[timeframe]]) if levels[timeframe] else 0.0
 
                 features[f'{timeframe}_level_count'] = count
                 features[f'{timeframe}_avg_strength'] = avg_strength

@@ -2,12 +2,16 @@
 Core Trading Types - Data structures for trading system
 """
 
+from typing_extensions import Literal
 import pandas as pd
 from enum import Enum
 from dataclasses import dataclass
 from typing import Optional
 
-from src.ta.technical_analysis import ChartInterval
+ChartInterval = Literal[
+    '1m', '2m', '3m', '5m', '10m', '15m', '30m',
+    '1h', '2h', '4h', 'D', 'W', 'M'
+]
 
 
 class TradingAction(Enum):

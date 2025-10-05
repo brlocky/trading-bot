@@ -6,7 +6,8 @@ Finds price channels using zigzag pivots and returns channel lines.
 from typing import List
 import pandas as pd
 import numpy as np
-from src.ta.technical_analysis import AnalysisDict, ChartInterval, Line, Pivot
+from core.trading_types import ChartInterval
+from src.ta.technical_analysis import AnalysisDict, Line, Pivot
 
 
 def _transform_price(price: float, log_scale: bool) -> float:

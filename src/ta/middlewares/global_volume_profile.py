@@ -10,7 +10,8 @@ try:
     from typing import TypedDict
 except ImportError:
     from typing_extensions import TypedDict
-from src.ta.technical_analysis import AnalysisDict, ChartInterval, VolumeProfileLine
+from core.trading_types import ChartInterval
+from src.ta.technical_analysis import AnalysisDict, VolumeProfileLine
 
 
 class VolumeProfileKeyLevels(TypedDict):

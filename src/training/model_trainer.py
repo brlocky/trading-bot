@@ -13,9 +13,10 @@ from sklearn.preprocessing import LabelEncoder
 import xgboost as xgb
 import warnings
 
-from src.training.autonomous_trainer import AutonomousTraderTrainer
-from src.memory.trade_memory import TradeMemoryManager
-from src.detection.bounce_detector import BounceDetector
+from detection.bounce_detector import BounceDetector
+from memory.trade_memory import TradeMemoryManager
+from training.autonomous_trainer import AutonomousTraderTrainer
+
 
 warnings.filterwarnings('ignore')
 
@@ -101,7 +102,7 @@ class SimpleModelTrainer:
 
             # Check label distribution
             label_counts = pd.Series(labels).value_counts()
-            print(f"📊 Label distribution:")
+            print("📊 Label distribution:")
             for label, count in label_counts.items():
                 percentage = count/len(labels)*100
                 print(f"   {label}: {count} ({percentage:.1f}%)")
@@ -207,7 +208,7 @@ class SimpleModelTrainer:
         level_files = {tf: training_files[tf] for tf in level_timeframes if tf in training_files}
         main_file = training_files['15m']  # Use 15m as main timeframe
 
-        print(f"Main timeframe: 15m")
+        print("Main timeframe: 15m")
         print(f"Level timeframes: {list(level_files.keys())}")
 
         # Prepare data
@@ -239,10 +240,10 @@ class SimpleModelTrainer:
             'importance': trained_model.feature_importances_
         }).sort_values('importance', ascending=False)
 
-        print(f"\n✅ TRAINING COMPLETE!")
+        print("\n✅ TRAINING COMPLETE!")
         print(f"   Model: {model_type}")
         print(f"   Test Accuracy: {test_accuracy:.1%}")
-        print(f"\n🔍 Top 10 Features:")
+        print("\n🔍 Top 10 Features:")
         for _, row in feature_importance.head(10).iterrows():
             print(f"     {row['feature']}: {row['importance']:.3f}")
 

@@ -8,7 +8,7 @@ import json
 import os
 from typing import Dict, List
 
-from src.core.trading_types import TradeRecord
+from core.trading_types import TradeRecord
 
 
 class TradeMemoryManager:

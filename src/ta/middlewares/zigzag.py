@@ -4,7 +4,8 @@ Zigzag Middleware for Technical Analysis
 import numpy as np
 import pandas as pd
 from typing import List
-from src.ta.technical_analysis import ChartInterval, Pivot, Line, AnalysisDict
+from core.trading_types import ChartInterval
+from src.ta.technical_analysis import Pivot, Line, AnalysisDict
 
 
 def zigzag_middleware(

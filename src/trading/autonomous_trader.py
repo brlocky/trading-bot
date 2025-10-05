@@ -7,9 +7,9 @@ import joblib
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
-from src.core.trading_types import TradingAction, TradingSignal
-from src.extraction.level_extractor import MultitimeframeLevelExtractor
-from src.extraction.feature_engineer import LevelBasedFeatureEngineer
+from core.trading_types import TradingAction, TradingSignal
+from extraction.level_extractor import MultitimeframeLevelExtractor
+from extraction.feature_engineer import LevelBasedFeatureEngineer
 
 
 class AutonomousTrader:
@@ -35,7 +35,7 @@ class AutonomousTrader:
             self.scalers = model_data['scalers']
             self.feature_names = model_data['feature_names']
 
-            print(f"✅ Loaded autonomous trading models")
+            print("✅ Loaded autonomous trading models")
             print(f"🎯 Available actions: {list(self.models.keys())}")
             print(f"🔧 Features: {len(self.feature_names)}")
             return True
@@ -289,7 +289,7 @@ def test_autonomous_trader():
     current_price = 65000.0  # Sample BTC price
     signal = trader.make_trading_decision(current_price, 2000000)
 
-    print(f"\n🎯 Trading Signal:")
+    print("\n🎯 Trading Signal:")
     print(f"   Action: {signal.action.value}")
     print(f"   Confidence: {signal.confidence:.1%}")
     print(f"   Entry: ${signal.entry_price:,.2f}" if signal.entry_price else "   Entry: N/A")

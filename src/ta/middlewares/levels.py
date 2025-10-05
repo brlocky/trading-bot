@@ -4,7 +4,8 @@ Detects significant price levels such as support and resistance
 """
 import pandas as pd
 from typing import List, cast
-from src.ta.technical_analysis import ChartInterval, Line, AnalysisDict, LineType
+from core.trading_types import ChartInterval
+from src.ta.technical_analysis import Line, AnalysisDict, LineType
 
 
 def levels_middleware(

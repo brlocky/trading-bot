@@ -5,7 +5,8 @@ Returns AnalysisDict compatible with other middlewares.
 """
 from typing import List
 import pandas as pd
-from src.ta.technical_analysis import AnalysisDict, ChartInterval, Line
+from core.trading_types import ChartInterval
+from src.ta.technical_analysis import AnalysisDict, Line
 from src.ta.middlewares.global_volume_profile import calculate_volume_profile_histogram
 
 # Number of last periods to process for volume profile calculation

@@ -10,6 +10,8 @@ Each middleware can process the data and add its own analysis results (such as p
 # Import necessary libraries
 import pandas as pd
 from typing import List, Callable, Dict, Optional, Tuple, Literal
+from core.trading_types import ChartInterval
+
 # TypedDict is used for type-safe dictionaries (Python <3.8 compatibility)
 try:
     from typing import TypedDict
@@ -21,10 +23,6 @@ except ImportError:
 # Pivot: (timestamp, price, type)
 Pivot = Tuple[pd.Timestamp, float, Optional[Literal['high', 'low']]]
 
-ChartInterval = Literal[
-    '1m', '2m', '3m', '5m', '10m', '15m', '30m',
-    '1h', '2h', '4h', 'D', 'W', 'M'
-]
 
 LineType = Literal['zigzag',
                    'vah_line', 'val_line', 'poc_line', 'naked_poc_line',

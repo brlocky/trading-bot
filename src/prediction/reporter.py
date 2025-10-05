@@ -209,7 +209,7 @@ class SimpleModelReporter:
 
         # Feature consistency check
         feature_columns = self.model_trainer.model_data.get('feature_columns', [])
-        print(f"\n🔧 Feature Consistency Check:")
+        print("\n🔧 Feature Consistency Check:")
         print(f"   Training features: {len(feature_columns)}")
         if len(feature_columns) > 0:
             print(f"   Key features: {feature_columns[:5]}{'...' if len(feature_columns) > 5 else ''}")
@@ -218,7 +218,7 @@ class SimpleModelReporter:
         action_counts = signals_df['action'].value_counts()
         total_signals = len(signals_df)
 
-        print(f"\n📊 Signal Distribution:")
+        print("\n📊 Signal Distribution:")
         for action in ['buy', 'sell', 'hold']:
             count = action_counts.get(action, 0)
             pct = count / total_signals * 100
@@ -244,7 +244,7 @@ class SimpleModelReporter:
         avg_sell_prob = signals_df['sell_prob'].mean()
         avg_hold_prob = signals_df['hold_prob'].mean()
 
-        print(f"\n🎯 Average Probabilities:")
+        print("\n🎯 Average Probabilities:")
         print(f"   BUY: {avg_buy_prob:.1%} | SELL: {avg_sell_prob:.1%} | HOLD: {avg_hold_prob:.1%}")
 
         # Performance metrics
@@ -252,8 +252,8 @@ class SimpleModelReporter:
         max_confidence = signals_df['confidence'].max()
         min_confidence = signals_df['confidence'].min()
 
-        print(f"\n📈 Confidence Metrics:")
+        print("\n📈 Confidence Metrics:")
         print(f"   Average: {avg_confidence:.1%} | Max: {max_confidence:.1%} | Min: {min_confidence:.1%}")
 
-        print(f"\n✅ TESTING COMPLETE!")
+        print("\n✅ TESTING COMPLETE!")
         print("=" * 50)

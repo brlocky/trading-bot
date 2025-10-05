@@ -6,12 +6,12 @@ import pandas as pd
 import json
 from typing import Dict, List
 
-from src.core.trading_types import LevelInfo
-from src.ta.technical_analysis import TechnicalAnalysisProcessor, AnalysisDict, ChartInterval
-from src.ta.middlewares.zigzag import zigzag_middleware
-from src.ta.middlewares.volume_profile import volume_profile_middleware
-from src.ta.middlewares.channels import channels_middleware
-from src.ta.middlewares.levels import levels_middleware
+from core.trading_types import ChartInterval, LevelInfo
+from ta.technical_analysis import TechnicalAnalysisProcessor, AnalysisDict
+from ta.middlewares.zigzag import zigzag_middleware
+from ta.middlewares.volume_profile import volume_profile_middleware
+from ta.middlewares.channels import channels_middleware
+from ta.middlewares.levels import levels_middleware
 
 
 class MultitimeframeLevelExtractor:
@@ -152,7 +152,7 @@ class MultitimeframeLevelExtractor:
                             last_test_time=pivot1[0] if len(pivot1) >= 1 else None
                         ))
 
-            except Exception as e:
+            except Exception:
                 continue  # Skip invalid lines
 
         return levels
@@ -186,7 +186,7 @@ class MultitimeframeLevelExtractor:
                             last_test_time=pivot1[0] if len(pivot1) >= 1 else None
                         ))
 
-            except Exception as e:
+            except Exception:
                 continue  # Skip invalid lines
 
         return levels
@@ -221,7 +221,7 @@ class MultitimeframeLevelExtractor:
                             timeframe=timeframe
                         ))
 
-            except Exception as e:
+            except Exception:
                 continue
 
         return levels
@@ -253,7 +253,7 @@ class MultitimeframeLevelExtractor:
                             last_test_time=timestamp
                         ))
 
-            except Exception as e:
+            except Exception:
                 continue
 
         return levels

@@ -7,7 +7,7 @@ import os
 import json
 from typing import Dict, Optional
 
-from src.trading.autonomous_trader import AutonomousTrader
+from trading.autonomous_trader import AutonomousTrader
 
 
 class SimpleModelPredictor:
@@ -168,9 +168,6 @@ class SimpleModelPredictor:
 
                 # Make prediction with probability analysis
                 probabilities = trained_model.predict_proba(feature_df)[0]
-                prediction_encoded = trained_model.predict(feature_df)[0]
-                base_prediction = label_encoder.inverse_transform([prediction_encoded])[0]
-                confidence = probabilities.max()
 
                 # Get class probabilities
                 classes = label_encoder.classes_
@@ -269,7 +266,7 @@ class SimpleModelPredictor:
 
         # Summary
         action_counts = signals_df['action'].value_counts()
-        print(f"\n📊 PREDICTION RESULTS:")
+        print("\n📊 PREDICTION RESULTS:")
         for action, count in action_counts.items():
             pct = count / len(signals_df) * 100
             print(f"   {action.upper()}: {count} ({pct:.1f}%)")

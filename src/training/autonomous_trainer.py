@@ -9,8 +9,6 @@ import json
 import warnings
 from datetime import datetime
 from typing import Dict, Tuple
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix
@@ -19,11 +17,11 @@ import seaborn as sns
 import xgboost as xgb
 import time
 
-from src.core.trading_types import TradingAction
-from src.extraction.level_extractor import MultitimeframeLevelExtractor
-from src.extraction.feature_engineer import LevelBasedFeatureEngineer
-from src.trading.autonomous_trader import AutonomousTrader
-from src.indicator_utils import add_progressive_indicators
+from core.trading_types import TradingAction
+from extraction.level_extractor import MultitimeframeLevelExtractor
+from extraction.feature_engineer import LevelBasedFeatureEngineer
+from indicator_utils import add_progressive_indicators
+from trading.autonomous_trader import AutonomousTrader
 
 warnings.filterwarnings('ignore')
 
@@ -317,96 +315,66 @@ class AutonomousTraderTrainer:
                     import subprocess
                     result = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
                     return result.returncode == 0
-                except:
+                except Exception:
                     return False
 
             gpu_available = detect_gpu()
-
-            # Train multiple models and select best
-            models_to_try = {
-                'random_forest': RandomForestClassifier(
-                    n_estimators=100, max_depth=10, random_state=random_state,
-                    class_weight='balanced'
-                ),
-                'gradient_boosting': GradientBoostingClassifier(
-                    n_estimators=100, max_depth=6, random_state=random_state
-                ),
-                'logistic_regression': LogisticRegression(
-                    random_state=random_state, class_weight='balanced', max_iter=1000
+            
+            if not gpu_available:
+                raise RuntimeError(
+                    f"❌ GPU not available for {action_name}! "
+                    "XGBoost GPU training requires CUDA-capable GPU. "
+                    "Check: 1) NVIDIA GPU installed, 2) CUDA drivers, 3) nvidia-smi command"
                 )
-            }
 
-            # Add XGBoost with GPU if available
-            if gpu_available:
-                try:
-                    models_to_try['xgboost_gpu'] = xgb.XGBClassifier(
-                        n_estimators=200, max_depth=8, learning_rate=0.1,
-                        random_state=random_state, tree_method='gpu_hist',
-                        gpu_id=0, eval_metric='mlogloss'
-                    )
-                    print(f"   🚀 XGBoost GPU enabled for {action_name}")
-                except:
-                    pass
+            print(f"   🚀 XGBoost GPU detected - Training {action_name} model...")
 
-            # Add XGBoost CPU as fallback
-            models_to_try['xgboost_cpu'] = xgb.XGBClassifier(
-                n_estimators=200, max_depth=8, learning_rate=0.1,
-                random_state=random_state, tree_method='hist',
-                n_jobs=4, eval_metric='mlogloss'
+            # Create XGBoost GPU model
+            model = xgb.XGBClassifier(
+                n_estimators=200,
+                max_depth=8,
+                learning_rate=0.1,
+                random_state=random_state,
+                tree_method='gpu_hist',
+                gpu_id=0,
+                eval_metric='mlogloss'
             )
 
-            best_model = None
-            best_score = -1
-            best_model_name = None
+            # Time the training
+            start_time = time.time()
 
-            for model_name, model in models_to_try.items():
-                try:
-                    # Time the training for performance comparison
-                    start_time = time.time()
+            # Cross-validation
+            print("   🔄 Running 5-fold cross-validation...")
+            cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=5, scoring='f1')
+            mean_score = np.mean(cv_scores)
+            std_score = np.std(cv_scores)
 
-                    # Cross-validation
-                    cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=5, scoring='f1')
-                    mean_score = np.mean(cv_scores)
+            training_time = time.time() - start_time
 
-                    training_time = time.time() - start_time
+            print(f"   � xgboost_gpu: CV F1 = {mean_score:.3f} ± {std_score:.3f} ({training_time:.2f}s)")
 
-                    gpu_indicator = "🚀" if "gpu" in model_name else "💻" if "xgboost" in model_name else "⚙️"
-                    print(f"   {gpu_indicator} {model_name}: CV F1 = {mean_score:.3f} ± {np.std(cv_scores):.3f} ({training_time:.2f}s)")
-
-                    if mean_score > best_score:
-                        best_score = mean_score
-                        best_model = model
-                        best_model_name = model_name
-
-                except Exception as e:
-                    print(f"   ❌ {model_name}: Error - {e}")
-                    continue
-
-            if best_model is None:
-                print(f"❌ No successful model for {action_name}")
-                continue
-
-            # Train best model on full training set
-            best_model.fit(X_train_scaled, y_train)
+            # Train model on full training set
+            print("   🎯 Training on full dataset...")
+            model.fit(X_train_scaled, y_train)
 
             # Evaluate on test set
-            y_pred = best_model.predict(X_test_scaled)
-            y_pred_proba = best_model.predict_proba(X_test_scaled)
+            y_pred = model.predict(X_test_scaled)
+            y_pred_proba = model.predict_proba(X_test_scaled)
 
             # Store results
-            self.models[action_name] = best_model
+            self.models[action_name] = model
             self.scalers[action_name] = scaler
 
             results[action_name] = {
-                'model_type': best_model_name,
-                'cv_score': best_score,
+                'model_type': 'xgboost_gpu',
+                'cv_score': mean_score,
                 'test_predictions': y_pred,
                 'test_probabilities': y_pred_proba,
                 'test_labels': y_test,
-                'feature_importance': self._get_feature_importance(best_model, features_df.columns)
+                'feature_importance': self._get_feature_importance(model, features_df.columns)
             }
 
-            print(f"✅ {action_name}: Best model = {best_model_name} (CV F1 = {best_score:.3f})")
+            print(f"✅ {action_name}: XGBoost GPU trained (CV F1 = {mean_score:.3f})")
 
             # Print classification report
             print(f"\n📊 {action_name} Classification Report:")
