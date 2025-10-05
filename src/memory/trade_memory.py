@@ -42,7 +42,7 @@ class TradeMemoryManager:
     def get_recent_performance(self, lookback_hours: int = 168) -> Dict[str, float]:
         """Get performance stats for recent trades (default: last 7 days)"""
         if not self.trades:
-            return {'win_rate': 0.5, 'avg_pnl': 0.0, 'total_trades': 0}
+            return {'win_rate': 0.0, 'avg_pnl': 0.0, 'total_trades': 0}
 
         cutoff_time = pd.Timestamp.now() - pd.Timedelta(hours=lookback_hours)
         recent_trades = [t for t in self.trades if t.timestamp >= cutoff_time and t.pnl_pct is not None]
@@ -65,7 +65,7 @@ class TradeMemoryManager:
         bounce_trades = [t for t in self.trades if t.was_bounce and t.pnl_pct is not None]
 
         if not bounce_trades:
-            return {'bounce_win_rate': 0.6, 'bounce_avg_pnl': 0.5, 'bounce_trades': 0}
+            return {'bounce_win_rate': 0.0, 'bounce_avg_pnl': 0.0, 'bounce_trades': 0}
 
         winning_bounces = [t for t in bounce_trades if t.pnl_pct > 0]
         bounce_win_rate = len(winning_bounces) / len(bounce_trades)
