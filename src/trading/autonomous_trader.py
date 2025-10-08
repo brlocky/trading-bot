@@ -1,305 +1,351 @@
 """
 Autonomous Trader - Main trading decision system combining multi-timeframe analysis
+
+This is the SINGLE SOURCE OF TRUTH for all feature calculation.
+All higher-level components (training, backtesting) use this for features.
 """
 
 import pandas as pd
 import joblib
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict
 
-from core.trading_types import TradingAction, TradingSignal
 from extraction.level_extractor import MultitimeframeLevelExtractor
 from extraction.feature_engineer import LevelBasedFeatureEngineer
+from memory.trade_memory import TradeMemoryManager
+from detection.bounce_detector import BounceDetector
+
+from ta.middlewares import (
+    zigzag_middleware,
+    levels_middleware,
+    channels_middleware,
+    volume_profile_middleware
+)
 
 
 class AutonomousTrader:
     """
     Main autonomous trading system that combines multi-timeframe analysis
-    with level-based feature engineering to make trading decisions
+    with level-based feature engineering to make trading decisions.
+
+    This is the SINGLE SOURCE OF TRUTH for feature calculation:
+    - 45 TA features (RSI, MACD, BB, etc.)
+    - 52 Level features (distance, strength, etc.)
+    - 10 Memory features (win rate, consecutive, etc.)
+    = 107 total features
+
+    Features are cached intelligently:
+    - TA features: Cached by data range (recalc when new candles)
+    - Level features: Cached by day (recalc at midnight UTC)
+    - Memory features: Always fresh (no cache)
     """
 
+    # Middleware configurations per timeframe (for TA feature calculation)
+    # These run during _calculate_ta_features() to add extra TA columns
+    MIDDLEWARE_CONFIG = {
+        '15m': [zigzag_middleware, volume_profile_middleware, channels_middleware],
+        '1h': [zigzag_middleware, channels_middleware],
+        'D': [zigzag_middleware, levels_middleware, channels_middleware],
+        'W': [zigzag_middleware, levels_middleware, channels_middleware],
+        'M': [zigzag_middleware, levels_middleware, channels_middleware]
+    }
+
+    @staticmethod
+    def get_extraction_config_for_timeframe(timeframe: str) -> Dict:
+        """
+        Hardcoded extraction configuration per timeframe.
+        Defines which middlewares to run and what data to extract from each.
+
+        Args:
+            timeframe: '15m', '1h', 'D', 'W', 'M'
+
+        Returns:
+            Dict with:
+            - middlewares: List of middlewares to run
+            - extract: Dict mapping middleware_name -> list of data types
+                      e.g., {'zigzag': ['pivots'], 'levels': ['lines']}
+
+        Middleware outputs:
+            - zigzag: ['lines', 'pivots']
+            - levels: ['lines']
+            - channels: ['lines', 'pivots']
+            - volume_profile_periods: ['lines']
+        """
+        configs = {
+            'M': {
+                'middlewares': [zigzag_middleware, levels_middleware, channels_middleware],
+                'extract': {
+                    'zigzag': ['pivots'],
+                    'levels': ['lines'],
+                    'channels': ['lines'],
+                }
+            },
+            'W': {
+                'middlewares': [zigzag_middleware, levels_middleware, channels_middleware],
+                'extract': {
+                    'zigzag': ['pivots'],
+                    'levels': ['lines'],
+                    'channels': ['lines'],
+                }
+            },
+            'D': {
+                'middlewares': [zigzag_middleware, levels_middleware, channels_middleware],
+                'extract': {
+                    'zigzag': ['pivots'],
+                    'levels': ['lines'],
+                    'channels': ['lines'],
+                }
+            },
+            '1h': {
+                'middlewares': [zigzag_middleware, channels_middleware],
+                'extract': {
+                    'zigzag': ['pivots', 'lines'],
+                    'channels': ['lines'],
+                }
+            },
+            '15m': {
+                'middlewares': [zigzag_middleware, levels_middleware, channels_middleware, volume_profile_middleware],
+                'extract': {
+                    'zigzag': ['pivots'],
+                    'channels': ['lines'],
+                    'volume_profile_periods': ['lines']
+                }
+            }
+        }
+
+        return configs.get(timeframe, {'middlewares': [], 'extract': {}})
+
     def __init__(self):
+        """
+        Initialize AutonomousTrader.
+
+        Uses hardcoded configurations:
+        - MIDDLEWARE_CONFIG: Controls which middlewares run during TA feature calculation
+        - get_extraction_config_for_timeframe(): Returns what to extract per timeframe
+
+        To customize, edit the class variables and static method above.
+        """
         self.level_extractor = MultitimeframeLevelExtractor()
         self.feature_engineer = LevelBasedFeatureEngineer()
+
+        # Memory and bounce detection systems
+        self.trade_memory = TradeMemoryManager()
+        self.bounce_detector = BounceDetector()
+
+        # Middleware configuration (for TA features)
+        self.middleware_config = self.MIDDLEWARE_CONFIG
+
+        # Model state
         self.models = {}
         self.scalers = {}
         self.feature_names = []
         self.current_levels = {}
         self.last_update = None
 
-    def load_models(self, model_file: str = 'models/autonomous_trader_models.joblib') -> bool:
-        """Load trained autonomous trading models"""
-        try:
-            model_data = joblib.load(model_file)
-            self.models = model_data['models']
-            self.scalers = model_data['scalers']
-            self.feature_names = model_data['feature_names']
+        # Caching state for features
+        self._ta_cache = None
+        self._ta_cache_key = None
+        self._level_cache = None
+        self._level_cache_date = None
 
-            print("✅ Loaded autonomous trading models")
-            print(f"🎯 Available actions: {list(self.models.keys())}")
-            print(f"🔧 Features: {len(self.feature_names)}")
-            return True
+    # ============================================================
+    # FEATURE CALCULATION - SINGLE SOURCE OF TRUTH
+    # ============================================================
 
-        except FileNotFoundError:
-            print(f"❌ Model file not found: {model_file}")
-            print("💡 Train models first using the autonomous trader trainer")
-            return False
-        except Exception as e:
-            print(f"❌ Error loading models: {e}")
-            return False
+    def get_all_features(
+        self,
+        data: pd.DataFrame,
+        levels: Dict,
+        current_date: pd.Timestamp,
+        timeframe: str = '15m',
+        use_log_scale: bool = True,
 
-    def update_levels(self, data_files: Dict[str, str], force_update: bool = False) -> bool:
-        """Update level information from multiple timeframes"""
-        try:
-            # Check if update is needed (avoid frequent re-computation)
-            current_time = datetime.now()
-            if (not force_update and self.last_update and
-                    (current_time - self.last_update).total_seconds() < 3600):  # 1 hour cache
-                return True
-
-            print("🔄 Updating multi-timeframe levels...")
-            self.current_levels = self.level_extractor.extract_levels_from_data(data_files)
-            self.last_update = current_time
-
-            total_levels = sum(len(levels) for levels in self.current_levels.values())
-            print(f"✅ Updated {total_levels} levels across {len(self.current_levels)} timeframes")
-            return True
-
-        except Exception as e:
-            print(f"❌ Error updating levels: {e}")
-            return False
-
-    def make_trading_decision(self, current_price: float, current_volume: float = 1000000,
-                              additional_features: Optional[Dict[str, float]] = None) -> TradingSignal:
+    ) -> pd.DataFrame:
         """
-        Make autonomous trading decision based on current market conditions and levels
+        Calculate ALL features for the given data.
+        This is the SINGLE SOURCE OF TRUTH for features across training, backtesting, and live trading.
+
+        Features are cached intelligently:
+        - TA features (Group 1): Cached by data range, recalculated when data changes
+        - Level features (Group 2): Cached per day, recalculated when day changes
+        - Memory features: Always calculated fresh (they're lightweight)
 
         Args:
-            current_price: Current market price
-            current_volume: Current trading volume
-            additional_features: Additional technical indicators (RSI, etc.)
+            data: OHLCV DataFrame with datetime index
+            levels: Dict of levels by timeframe (from MultitimeframeLevelExtractor)
+            timeframe: Timeframe identifier (e.g., '15m', '1h', 'D')
+            use_log_scale: Whether to use logarithmic scale for TA features
+            current_date: Current timestamp (defaults to last candle timestamp)
 
         Returns:
-            TradingSignal with action and reasoning
+            DataFrame with all features:
+            - 45 TA features (RSI, MACD, BB, etc.)
+            - 52 Level features (distance, strength, etc.)
+            - 10 Memory features (win rate, consecutive, etc.)
+            = 107 total features
         """
-        if not self.models:
-            return TradingSignal(
-                action=TradingAction.HOLD,
-                confidence=0.0,
-                reasoning="No models loaded"
+        if current_date is None:
+            current_date = data.index[-1]
+
+        print("\n" + "="*70)
+        print("🔮 FEATURE CALCULATION (AutonomousTrader - Single Source of Truth)")
+        print("="*70)
+        start_time = datetime.now()
+
+        # 1. Calculate TA features (Group 1 - cached by data range)
+        ta_features = self._calculate_ta_features(data, timeframe, use_log_scale)
+
+        # 2. Calculate Level features (Group 2 - cached by day, checks day change)
+        level_features = self._calculate_level_features(data, levels, current_date)
+
+        # 3. Calculate Memory features (always fresh)
+        memory_features = self._calculate_memory_features(data)
+
+        # 4. Combine all
+        all_features = pd.concat([ta_features, level_features, memory_features], axis=1)
+
+        total_time = (datetime.now() - start_time).total_seconds()
+
+        print(f"\n✅ TOTAL FEATURES: {len(all_features.columns)}")
+        print(f"⏱️  Total time: {total_time:.2f} seconds")
+        print("="*70 + "\n")
+
+        return all_features
+
+    def _calculate_ta_features(self, data: pd.DataFrame, timeframe: str, use_log_scale: bool) -> pd.DataFrame:
+        """
+        Calculate technical analysis features using existing TA processor.
+
+        Caching strategy:
+        - Cache key = (timeframe, start_date, end_date, num_candles)
+        - Recalculates when data range changes (new candles added)
+        - This is FAST for backtesting (calculate once for entire dataset)
+        """
+        start_time = datetime.now()
+
+        # Create cache key
+        start_date = data.index[0].strftime('%Y%m%d')
+        end_date = data.index[-1].strftime('%Y%m%d')
+        cache_key = f"ta_{timeframe}_{start_date}_{end_date}_{len(data)}"
+
+        # Check cache
+        if self._ta_cache is not None and self._ta_cache_key == cache_key:
+            print(f"✅ Using cached TA features ({cache_key})")
+            return self._ta_cache
+
+        print(f"🔄 Calculating TA features ({cache_key})...")
+
+        # Add traditional TA indicators (RSI, MACD, BB, etc.) using TA-Lib
+        from indicator_utils import add_progressive_indicators
+
+        df_with_indicators = add_progressive_indicators(data.copy())
+
+        # Extract only the indicator columns (exclude OHLCV and metadata)
+        base_columns = ['open', 'high', 'low', 'close', 'volume']
+        metadata_columns = ['levels_json']  # Exclude non-feature columns from parquet
+        exclude_columns = base_columns + metadata_columns
+        indicator_columns = [col for col in df_with_indicators.columns if col not in exclude_columns]
+
+        ta_features = df_with_indicators[indicator_columns].bfill().ffill()
+
+        # Cache it
+        self._ta_cache = ta_features
+        self._ta_cache_key = cache_key
+
+        elapsed_time = (datetime.now() - start_time).total_seconds()
+        print(f"✅ TA features calculated and cached: {len(ta_features.columns)} features ({elapsed_time:.2f}s)")
+        return ta_features
+
+    def _calculate_level_features(self, data: pd.DataFrame, levels: Dict, current_date: datetime) -> pd.DataFrame:
+        """
+        Calculate level-based features for all candles.
+
+        No caching - data changes every iteration in progressive training.
+        """
+        start_time = datetime.now()
+        total_levels = sum(len(lvls) for lvls in levels.values())
+        print(f"🔄 Calculating level features: {len(data):,} candles with {total_levels:,} levels...")
+
+        from extraction.feature_engineer import LevelBasedFeatureEngineer
+        engineer = LevelBasedFeatureEngineer()
+
+        # Only use parallel processing if we have MANY candles (overhead for small/medium batches)
+        # Progressive training = small batches, so use higher threshold
+        PARALLEL_THRESHOLD = 1000  # Use parallel only if >= 1000 candles
+
+        if len(data) >= PARALLEL_THRESHOLD:
+            print(f"   🚀 Using parallel processing (large batch: {len(data)} candles)...")
+
+            from joblib import Parallel, delayed
+            import multiprocessing
+
+            # Use all available cores
+            n_jobs = min(8, multiprocessing.cpu_count())  # Cap at 8 to avoid overhead
+            print(f"   Using {n_jobs} CPU cores...")
+
+            # Parallel processing with progress
+            feature_rows = Parallel(n_jobs=n_jobs, verbose=10)(
+                delayed(engineer.create_level_features)(
+                    float(row['close']),
+                    float(row['volume']),
+                    levels
+                )
+                for idx, row in data.iterrows()
             )
-
-        if not self.current_levels:
-            return TradingSignal(
-                action=TradingAction.HOLD,
-                confidence=0.0,
-                reasoning="No level data available"
-            )
-
-        try:
-            # Create level-based features
-            features = self.feature_engineer.create_level_features(
-                current_price, current_volume, self.current_levels
-            )
-
-            # Add additional features if provided
-            if additional_features:
-                features.update(additional_features)
-
-            # Convert to DataFrame for model input
-            feature_df = pd.DataFrame([features])
-
-            # Ensure all required features are present
-            for feature_name in self.feature_names:
-                if feature_name not in feature_df.columns:
-                    feature_df[feature_name] = 0.0
-
-            # Reorder columns to match training
-            feature_df = feature_df[self.feature_names]
-
-            # Make predictions for each action
-            action_probabilities = {}
-            for action_name, model in self.models.items():
-                if action_name in self.scalers:
-                    X_scaled = self.scalers[action_name].transform(feature_df)
-                    prob = model.predict_proba(X_scaled)[0]
-
-                    # Get probability for positive class (action should be taken)
-                    action_probabilities[action_name] = prob[1] if len(prob) > 1 else prob[0]
-
-            # Determine best action
-            best_action = max(action_probabilities.items(), key=lambda x: x[1])
-            action_name, confidence = best_action
-
-            # Convert action name to TradingAction enum
-            action = TradingAction(action_name)
-
-            # Calculate entry/exit levels based on nearby support/resistance
-            entry_price, stop_loss, take_profit = self._calculate_trade_levels(
-                current_price, action, features
-            )
-
-            # Generate reasoning
-            reasoning = self._generate_reasoning(action, confidence, features)
-
-            return TradingSignal(
-                action=action,
-                confidence=confidence,
-                entry_price=entry_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                reasoning=reasoning,
-                risk_reward_ratio=self._calculate_risk_reward(entry_price, stop_loss, take_profit)
-            )
-
-        except Exception as e:
-            print(f"❌ Error making trading decision: {e}")
-            return TradingSignal(
-                action=TradingAction.HOLD,
-                confidence=0.0,
-                reasoning=f"Error in decision making: {e}"
-            )
-
-    def _calculate_trade_levels(self, current_price: float, action: TradingAction,
-                                features: Dict[str, float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-        """Calculate entry, stop loss, and take profit levels"""
-        if action == TradingAction.HOLD:
-            return None, None, None
-
-        entry_price = current_price
-
-        # Use support/resistance distances for stop loss and take profit
-        support_distance = features.get('distance_to_support', 2.0)
-        resistance_distance = features.get('distance_to_resistance', 2.0)
-
-        if action == TradingAction.BUY:
-            # Stop loss below support, take profit near resistance
-            stop_loss = current_price * (1 - (support_distance + 0.5) / 100)
-            take_profit = current_price * (1 + (resistance_distance - 0.2) / 100)
-
-        elif action == TradingAction.SELL:
-            # Stop loss above resistance, take profit near support
-            stop_loss = current_price * (1 + (resistance_distance + 0.5) / 100)
-            take_profit = current_price * (1 - (support_distance - 0.2) / 100)
-
         else:
-            stop_loss = None
-            take_profit = None
+            print(f"   ⚡ Using sequential processing (small batch: {len(data)} candles)...")
 
-        return entry_price, stop_loss, take_profit
+            # Sequential processing (faster for small batches due to no overhead)
+            feature_rows = []
+            for idx, row in data.iterrows():
+                features = engineer.create_level_features(
+                    float(row['close']),
+                    float(row['volume']),
+                    levels
+                )
+                feature_rows.append(features)
 
-    def _calculate_risk_reward(self, entry_price: Optional[float],
-                               stop_loss: Optional[float],
-                               take_profit: Optional[float]) -> Optional[float]:
-        """Calculate risk-reward ratio"""
-        if not all([entry_price, stop_loss, take_profit]):
-            return None
+        level_features = pd.DataFrame(feature_rows, index=data.index)
 
-        risk = abs(entry_price - stop_loss)
-        reward = abs(take_profit - entry_price)
+        elapsed_time = (datetime.now() - start_time).total_seconds()
+        print(f"✅ Level features calculated: {len(level_features.columns)} features ({elapsed_time:.2f}s)")
+        return level_features
 
-        return reward / risk if risk > 0 else None
+    def _calculate_memory_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate memory-based features for all candles.
 
-    def _generate_reasoning(self, action: TradingAction, confidence: float,
-                            features: Dict[str, float]) -> str:
-        """Generate human-readable reasoning for the trading decision"""
-        reasoning_parts = []
+        Memory features are always calculated fresh (no cache) because:
+        - They reflect current trade history
+        - Calculation is very fast (< 1ms)
+        - They need to be updated after each trade
+        """
+        start_time = datetime.now()
+        feature_rows = []
 
-        # Action and confidence
-        reasoning_parts.append(f"Action: {action.value.upper()} (confidence: {confidence:.1%})")
+        # Get current memory stats (same for all candles in this batch)
+        recent_perf = self.trade_memory.get_recent_performance()
+        bounce_perf = self.trade_memory.get_bounce_performance()
+        consecutive = self.trade_memory.get_consecutive_performance()
 
-        # Level analysis
-        support_dist = features.get('distance_to_support', 0)
-        resistance_dist = features.get('distance_to_resistance', 0)
-
-        if support_dist < 1.0:
-            reasoning_parts.append(f"Near support level ({support_dist:.2f}% away)")
-        if resistance_dist < 1.0:
-            reasoning_parts.append(f"Near resistance level ({resistance_dist:.2f}% away)")
-
-        # Strength analysis
-        support_strength = features.get('support_strength', 0)
-        resistance_strength = features.get('resistance_strength', 0)
-
-        if support_strength > 0.8:
-            reasoning_parts.append("Strong support detected")
-        if resistance_strength > 0.8:
-            reasoning_parts.append("Strong resistance detected")
-
-        # Volume context
-        volume_norm = features.get('volume_normalized', 1.0)
-        if volume_norm > 2.0:
-            reasoning_parts.append("High volume environment")
-        elif volume_norm < 0.5:
-            reasoning_parts.append("Low volume environment")
-
-        return " | ".join(reasoning_parts)
-
-    def get_current_market_context(self) -> Dict[str, any]:
-        """Get current market context including levels and features"""
-        if not self.current_levels:
-            return {"error": "No level data available"}
-
-        context = {
-            "last_update": self.last_update.isoformat() if self.last_update else None,
-            "timeframes": list(self.current_levels.keys()),
-            "total_levels": sum(len(levels) for levels in self.current_levels.values()),
-            "levels_by_timeframe": {}
-        }
-
-        for timeframe, levels in self.current_levels.items():
-            context["levels_by_timeframe"][timeframe] = {
-                "count": len(levels),
-                "types": list(set(level.level_type for level in levels)),
-                "price_range": {
-                    "min": min(level.price for level in levels) if levels else None,
-                    "max": max(level.price for level in levels) if levels else None
-                }
+        for idx, row in data.iterrows():
+            memory_features = {
+                'win_rate_7d': recent_perf['win_rate'],
+                'avg_pnl_7d': recent_perf['avg_pnl'],
+                'bounce_win_rate': bounce_perf['bounce_win_rate'],
+                'consecutive_wins': max(0, consecutive),
+                'consecutive_losses': max(0, -consecutive),
+                'total_trades': len(self.trade_memory.trades),
+                'recent_trade_count': len([t for t in self.trade_memory.trades if t.is_recent(7)]),
+                'avg_hold_time': recent_perf.get('avg_hold_time', 0),
+                'max_drawdown': recent_perf.get('max_drawdown', 0),
+                'sharpe_ratio': recent_perf.get('sharpe_ratio', 0),
             }
+            feature_rows.append(memory_features)
 
-        return context
+        memory_features_df = pd.DataFrame(feature_rows, index=data.index)
 
+        elapsed_time = (datetime.now() - start_time).total_seconds()
+        print(f"✅ Memory features calculated: {len(memory_features_df.columns)} features ({elapsed_time:.3f}s)")
 
-def test_autonomous_trader():
-    """Test the autonomous trading system"""
-    print("🧪 Testing Autonomous Trading System")
-    print("=" * 50)
-
-    # Initialize trader
-    trader = AutonomousTrader()
-
-    # Test level extraction with sample data files
-    data_files = {
-        'M': 'data/BTCUSDT-M.json',
-        'W': 'data/BTCUSDT-W.json',
-        'D': 'data/BTCUSDT-D.json'
-    }
-
-    # Update levels
-    success = trader.update_levels(data_files, force_update=True)
-    if not success:
-        print("❌ Failed to update levels")
-        return False
-
-    # Get market context
-    context = trader.get_current_market_context()
-    print(f"📊 Market Context: {context}")
-
-    # Test trading decision (without trained models)
-    current_price = 65000.0  # Sample BTC price
-    signal = trader.make_trading_decision(current_price, 2000000)
-
-    print("\n🎯 Trading Signal:")
-    print(f"   Action: {signal.action.value}")
-    print(f"   Confidence: {signal.confidence:.1%}")
-    print(f"   Entry: ${signal.entry_price:,.2f}" if signal.entry_price else "   Entry: N/A")
-    print(f"   Stop Loss: ${signal.stop_loss:,.2f}" if signal.stop_loss else "   Stop Loss: N/A")
-    print(f"   Take Profit: ${signal.take_profit:,.2f}" if signal.take_profit else "   Take Profit: N/A")
-    print(f"   Risk/Reward: {signal.risk_reward_ratio:.2f}" if signal.risk_reward_ratio else "   Risk/Reward: N/A")
-    print(f"   Reasoning: {signal.reasoning}")
-
-    return True
-
-
-if __name__ == "__main__":
-    test_autonomous_trader()
+        return memory_features_df

@@ -4,8 +4,8 @@ Bounce Detection - Support/Resistance Level Analysis
 
 from typing import Dict, List, Tuple, Optional
 
-from src.core.trading_types import LevelInfo
-from src.extraction.level_extractor import MultitimeframeLevelExtractor
+from core.trading_types import LevelInfo
+from extraction.level_extractor import MultitimeframeLevelExtractor
 
 
 class BounceDetector:

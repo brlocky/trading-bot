@@ -2,7 +2,7 @@
 Training Module - Model training and backtesting
 """
 
-from .autonomous_trainer import AutonomousTraderTrainer
 from .model_trainer import SimpleModelTrainer
+from .data_loader import DataLoader
 
-__all__ = ['AutonomousTraderTrainer', 'SimpleModelTrainer']
+__all__ = ['SimpleModelTrainer', 'DataLoader']

@@ -90,24 +90,24 @@ class LevelBasedFeatureEngineer:
 
     def _create_strength_features(self, levels: List[LevelInfo]) -> Dict[str, float]:
         """Create features based on level strength"""
-        features = {}
+        features: Dict[str, float] = {}
 
         if not levels:
             return {'avg_level_strength': 0.0, 'max_level_strength': 0.0}
 
         strengths = [level.strength for level in levels]
-        features['avg_level_strength'] = np.mean(strengths)
-        features['max_level_strength'] = np.max(strengths)
+        features['avg_level_strength'] = float(np.mean(strengths))
+        features['max_level_strength'] = float(np.max(strengths))
 
         # Strength by level type
-        level_types = {}
+        level_types: Dict[str, List[float]] = {}
         for level in levels:
             if level.level_type not in level_types:
                 level_types[level.level_type] = []
             level_types[level.level_type].append(level.strength)
 
         for level_type, type_strengths in level_types.items():
-            features[f'{level_type}_strength'] = np.mean(type_strengths)
+            features[f'{level_type}_strength'] = float(np.mean(type_strengths))
 
         return features
 
@@ -119,9 +119,9 @@ class LevelBasedFeatureEngineer:
         support_levels = [level for level in levels if level.price < current_price]
         resistance_levels = [level for level in levels if level.price > current_price]
 
-        features['support_count'] = len(support_levels)
-        features['resistance_count'] = len(resistance_levels)
-        features['support_resistance_ratio'] = (
+        features['support_count'] = float(len(support_levels))
+        features['resistance_count'] = float(len(resistance_levels))
+        features['support_resistance_ratio'] = float(
             len(support_levels) / max(len(resistance_levels), 1)
         )
 
@@ -129,9 +129,9 @@ class LevelBasedFeatureEngineer:
         support_strength = sum(level.strength / max(level.distance, 0.1) for level in support_levels)
         resistance_strength = sum(level.strength / max(level.distance, 0.1) for level in resistance_levels)
 
-        features['weighted_support_strength'] = support_strength
-        features['weighted_resistance_strength'] = resistance_strength
-        features['strength_balance'] = (
+        features['weighted_support_strength'] = float(support_strength)
+        features['weighted_resistance_strength'] = float(resistance_strength)
+        features['strength_balance'] = float(
             support_strength / max(resistance_strength, 0.1)
         )
 
@@ -139,18 +139,19 @@ class LevelBasedFeatureEngineer:
 
     def _create_timeframe_features(self, levels: Dict[ChartInterval, List[LevelInfo]]) -> Dict[str, float]:
         """Create features based on timeframe importance"""
-        features = {}
+        features: Dict[str, float] = {}
 
         timeframe_weights = {'M': 3.0, 'W': 2.0, 'D': 1.0}  # Monthly > Weekly > Daily
 
-        for timeframe, weight in timeframe_weights.items():
+        for timeframe_str, weight in timeframe_weights.items():
+            timeframe: ChartInterval = timeframe_str  # type: ignore  # We know these are valid ChartInterval values
             if timeframe in levels:
                 count = len(levels[timeframe])
-                avg_strength = np.mean([level.strength for level in levels[timeframe]]) if levels[timeframe] else 0.0
+                avg_strength = float(np.mean([level.strength for level in levels[timeframe]])) if levels[timeframe] else 0.0
 
-                features[f'{timeframe}_level_count'] = count
+                features[f'{timeframe}_level_count'] = float(count)
                 features[f'{timeframe}_avg_strength'] = avg_strength
-                features[f'{timeframe}_weighted_importance'] = count * avg_strength * weight
+                features[f'{timeframe}_weighted_importance'] = float(count * avg_strength * weight)
 
         return features
 

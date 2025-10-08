@@ -50,14 +50,20 @@ class TradeMemoryManager:
         if not recent_trades:
             return {'win_rate': 0.5, 'avg_pnl': 0.0, 'total_trades': 0}
 
-        winning_trades = [t for t in recent_trades if t.pnl_pct > 0]
-        win_rate = len(winning_trades) / len(recent_trades)
-        avg_pnl = np.mean([t.pnl_pct for t in recent_trades])
+        # Filter trades with valid pnl_pct values
+        trades_with_pnl = [t for t in recent_trades if t.pnl_pct is not None]
+        if not trades_with_pnl:
+            return {'win_rate': 0.5, 'avg_pnl': 0.0, 'total_trades': 0}
+
+        winning_trades = [t for t in trades_with_pnl if t.pnl_pct is not None and t.pnl_pct > 0]
+        win_rate = len(winning_trades) / len(trades_with_pnl)
+        pnl_values = [t.pnl_pct for t in trades_with_pnl if t.pnl_pct is not None]
+        avg_pnl = float(np.mean(pnl_values))
 
         return {
             'win_rate': win_rate,
             'avg_pnl': avg_pnl,
-            'total_trades': len(recent_trades)
+            'total_trades': len(trades_with_pnl)
         }
 
     def get_bounce_performance(self) -> Dict[str, float]:
@@ -67,9 +73,10 @@ class TradeMemoryManager:
         if not bounce_trades:
             return {'bounce_win_rate': 0.0, 'bounce_avg_pnl': 0.0, 'bounce_trades': 0}
 
-        winning_bounces = [t for t in bounce_trades if t.pnl_pct > 0]
+        winning_bounces = [t for t in bounce_trades if t.pnl_pct is not None and t.pnl_pct > 0]
         bounce_win_rate = len(winning_bounces) / len(bounce_trades)
-        bounce_avg_pnl = np.mean([t.pnl_pct for t in bounce_trades])
+        pnl_values = [t.pnl_pct for t in bounce_trades if t.pnl_pct is not None]
+        bounce_avg_pnl = float(np.mean(pnl_values))
 
         return {
             'bounce_win_rate': bounce_win_rate,
@@ -90,7 +97,7 @@ class TradeMemoryManager:
         # Count consecutive wins from the most recent trade
         consecutive = 0
         for trade in reversed(completed_trades):
-            if trade.pnl_pct > 0:  # Win
+            if trade.pnl_pct is not None and trade.pnl_pct > 0:  # Win
                 consecutive += 1
             else:  # Loss - break the streak
                 break
@@ -133,7 +140,7 @@ class TradeMemoryManager:
                 # Convert back to TradeRecord objects
                 self.trades = []
                 for trade_dict in trade_data:
-                    timestamp = pd.Timestamp(trade_dict['timestamp']) if trade_dict['timestamp'] else None
+                    timestamp = pd.Timestamp(trade_dict['timestamp']) if trade_dict['timestamp'] else pd.Timestamp.now()
                     trade = TradeRecord(
                         timestamp=timestamp,
                         signal_type=trade_dict['signal_type'],

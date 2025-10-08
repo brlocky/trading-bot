@@ -5,12 +5,13 @@ Detects significant price levels such as support and resistance
 import pandas as pd
 from typing import List, cast
 from core.trading_types import ChartInterval
-from src.ta.technical_analysis import Line, AnalysisDict, LineType
+from ta.technical_analysis import Line, AnalysisDict, LineType, Pivot
 
 
 def levels_middleware(
     time_frame: ChartInterval,
     price_data: pd.DataFrame,
+    last_Pivot: Pivot,
     analysis: AnalysisDict,
     useLogScale: bool = True,
 ) -> AnalysisDict:
@@ -39,30 +40,82 @@ def levels_middleware(
     highs = price_data['high'].values
     lows = price_data['low'].values
     opens = price_data['open'].values
+    volumes = price_data['volume'].values
 
     # 1. Find untouched closes (includes special handling for last 2 candles with same close/open)
-    untouched_closes = find_untouched_closes(time_frame, times, closes, highs, lows, opens)
-
-    # 2. Get period high and low lines
-    period_lines = get_period_high_low_lines(price_data, time_frame, times)
+    untouched_closes = find_untouched_closes(time_frame, times, closes, highs, lows, opens, volumes)
 
     # Create horizontal lines for untouched closes
-    for close_time, close_price in untouched_closes:
+    for close_time, close_price, volume in untouched_closes:
         end_time = times[-1]
         # Create horizontal line as two pivots with same price
-        start_pivot = (close_time, close_price, 'high')  # Type doesn't matter for horizontal lines
-        end_pivot = (end_time, close_price, 'high')
+        start_pivot = (close_time, close_price, None)  # Type doesn't matter for horizontal lines
+        end_pivot = (end_time, close_price, None)
 
         line_type = cast(LineType, f'line_close_{time_frame}')  # Cast string to LineType
-        levels_lines.append((start_pivot, end_pivot, line_type))
+        levels_lines.append((start_pivot, end_pivot, line_type, volume))
 
-    # Add period high/low lines
-    levels_lines.extend(period_lines)
+    # Filter and select top levels based on volume and proximity to last pivot
+    filtered_lines = filter_top_levels(levels_lines, last_Pivot)
 
-    return {'levels': {'lines': levels_lines}}
+    return {'levels': {'lines': filtered_lines}}
 
 
-def find_untouched_closes(time_frame: ChartInterval, times, closes, highs, lows, opens):
+def filter_top_levels(levels_lines: List[Line], last_pivot: Pivot, top_strong: int = 5, top_close: int = 5) -> List[Line]:
+    """
+    Filter levels to show only:
+    - Top 5 strongest levels (by volume)
+    - Top 5 closest levels to last pivot price (from remaining levels)
+
+    Args:
+        levels_lines: List of all detected level lines (start_pivot, end_pivot, line_type, volume)
+        last_pivot: Last pivot point (timestamp, price, type)
+        top_strong: Number of strongest levels to include (default: 5)
+        top_close: Number of closest levels to include (default: 5)
+
+    Returns:
+        List[Line]: Filtered list of up to 10 levels
+    """
+    if not levels_lines:
+        return []
+
+    # Extract last pivot price once
+    last_pivot_price = last_pivot[1]
+
+    # 1. Sort by volume (descending) and get top 5 strongest
+    sorted_by_volume = sorted(levels_lines, key=lambda x: x[3] or 0, reverse=True)
+    top_5_strongest = sorted_by_volume[:top_strong]
+
+    # 2. For remaining levels, find closest to current price
+    # Use simple exclusion by comparing objects directly
+    remaining_levels = []
+    for level in levels_lines:
+        # Check if this level is NOT in top_5_strongest
+        is_in_strongest = False
+        for strong_level in top_5_strongest:
+            if (level[0] == strong_level[0] and  # Same start pivot
+                    level[1] == strong_level[1] and  # Same end pivot
+                    level[2] == strong_level[2]):    # Same line type
+                is_in_strongest = True
+                break
+
+        if not is_in_strongest:
+            remaining_levels.append(level)
+
+    # Sort remaining by distance to pivot price
+    sorted_by_distance = sorted(
+        remaining_levels,
+        key=lambda x: abs(x[0][1] - last_pivot_price)
+    )
+
+    # Get top 5 closest
+    top_5_closest = sorted_by_distance[:top_close]
+
+    # Combine and return
+    return top_5_strongest + top_5_closest
+
+
+def find_untouched_closes(time_frame: ChartInterval, times, closes, highs, lows, opens, volumes) -> List[tuple]:
     """
     Find close prices that were never revisited (untouched).
 
@@ -76,9 +129,10 @@ def find_untouched_closes(time_frame: ChartInterval, times, closes, highs, lows,
         highs: Array of high prices
         lows: Array of low prices
         opens: Array of open prices
+        volumes: Array of volumes
 
     Returns:
-        List of (timestamp, price) tuples for untouched closes
+        List of (timestamp, price, volume) tuples for untouched closes
     """
     untouched = []
     n_candles = len(closes)
@@ -87,6 +141,7 @@ def find_untouched_closes(time_frame: ChartInterval, times, closes, highs, lows,
         close_price = closes[i]
         open_price = opens[i]
         close_time = times[i]
+        close_volume = volumes[i]
 
         # Get next candle data
         next_open = opens[i + 1]
@@ -107,7 +162,7 @@ def find_untouched_closes(time_frame: ChartInterval, times, closes, highs, lows,
 
                 if not is_touched:
                     # Validate line type using helper from technical_analysis
-                    untouched.append((close_time, close_price))
+                    untouched.append((close_time, close_price, close_volume))
     return untouched
 
 
@@ -131,43 +186,3 @@ def _check_level_touched_consecutive(candle_idx, close_price, highs, lows, n_can
         if lows[j] <= close_price <= highs[j]:
             return True
     return False
-
-
-def get_period_high_low_lines(price_data: pd.DataFrame, time_frame: ChartInterval, times) -> List[Line]:
-    """
-    Find period high and low levels and return them as horizontal lines.
-
-    Args:
-        price_data: OHLCV DataFrame with columns ['open', 'high', 'low', 'close', 'volume']
-        time_frame: Chart interval (e.g., '1h', 'D')
-        times: Array of timestamps
-
-    Returns:
-        List[Line]: List containing two lines - period high and period low
-    """
-    lines: List[Line] = []
-
-    # Find period high and low
-    period_high_idx = price_data['high'].argmax()
-    period_low_idx = price_data['low'].argmin()
-
-    period_high_level = price_data['high'].iloc[period_high_idx]
-    period_low_level = price_data['low'].iloc[period_low_idx]
-
-    # Create horizontal lines spanning the entire time range
-    start_time = times[0]
-    end_time = times[-1]
-
-    # Period high line
-    high_start = (start_time, period_high_level, 'high')
-    high_end = (end_time, period_high_level, 'high')
-    line_type = cast(LineType, f'max_level_{time_frame}')
-    lines.append((high_start, high_end, line_type))
-
-    # Period low line
-    low_start = (start_time, period_low_level, 'low')
-    low_end = (end_time, period_low_level, 'low')
-    line_type = cast(LineType, f'min_level_{time_frame}')
-    lines.append((low_start, low_end, line_type))
-
-    return lines

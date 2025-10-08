@@ -5,12 +5,13 @@ import numpy as np
 import pandas as pd
 from typing import List
 from core.trading_types import ChartInterval
-from src.ta.technical_analysis import Pivot, Line, AnalysisDict
+from ta.technical_analysis import Pivot, Line, AnalysisDict
 
 
 def zigzag_middleware(
     time_frame: ChartInterval,
     price_data: pd.DataFrame,
+    last_Pivot: Pivot,
     analysis: AnalysisDict,
     useLogScale: bool = True,
     threshold: 'float | None' = None,
@@ -118,7 +119,7 @@ def zigzag_middleware(
 
     # Format zigzag lines as pairs of pivots (linear prices only)
     zigzag_lines: List[Line] = [
-        ((p1[0], float(p1[1]), p1[2]), (p2[0], float(p2[1]), p2[2]), 'zigzag')
+        ((p1[0], float(p1[1]), p1[2]), (p2[0], float(p2[1]), p2[2]), 'zigzag', None)
         for p1, p2 in zip(pivots[:-1], pivots[1:])
     ]
 
@@ -182,11 +183,12 @@ def refine_zigzag(
         highs = segment['high'].to_numpy()
         lows = segment['low'].to_numpy()
 
-        max_high = np.max(highs)
+        # Type cast to handle potential mypy confusion about column types
+        max_high: float = float(np.max(highs.astype(float)))
         max_idx = int(np.argmax(highs))
         max_abs_idx = segment.index[int(max_idx)]
 
-        min_low = np.min(lows)
+        min_low: float = float(np.min(lows.astype(float)))
         min_idx = int(np.argmin(lows))
         min_abs_idx = segment.index[int(min_idx)]
 
@@ -194,32 +196,32 @@ def refine_zigzag(
         # Same type pivots: must have opposite extreme in between
         # Case 1: Two consecutive lows, insert max high between them
         if p1[2] == 'low' and p2[2] == 'low':
-            pivots.insert(i+1, (max_abs_idx, float(max_high), 'high'))
+            pivots.insert(i+1, (max_abs_idx, max_high, 'high'))
             continue
 
         # Case 2: Two consecutive highs, insert min low between them
         if p1[2] == 'high' and p2[2] == 'high':
-            pivots.insert(i+1, (min_abs_idx, float(min_low), 'low'))
+            pivots.insert(i+1, (min_abs_idx, min_low, 'low'))
             continue
 
         # Case 3: p2 is a low, but a lower low exists in the segment
         if min_low < p2[1] and p2[2] == 'low':
-            pivots[i+1] = (min_abs_idx, float(min_low), 'low')
+            pivots[i+1] = (min_abs_idx, min_low, 'low')
             continue
 
         # Case 4: p2 is a high, but a higher high exists in the segment
         if max_high > p2[1] and p2[2] == 'high':
-            pivots[i+1] = (max_abs_idx, float(max_high), 'high')
+            pivots[i+1] = (max_abs_idx, max_high, 'high')
             continue
 
         # Case 5: p1 is a low, but a lower low exists in the segment
         if min_low < p1[1] and p1[2] == 'low':
-            pivots[i] = (min_abs_idx, float(min_low), 'low')
+            pivots[i] = (min_abs_idx, min_low, 'low')
             continue
 
         # Case 6: p1 is a high, but a higher high exists in the segment
         if max_high > p1[1] and p1[2] == 'high':
-            pivots[i] = (max_abs_idx, float(max_high), 'high')
+            pivots[i] = (max_abs_idx, max_high, 'high')
             continue
 
         # Case 7: If p2 is a red candle, is a low, but its high is greater than previous high pivot

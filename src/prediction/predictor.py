@@ -7,8 +7,6 @@ import os
 import json
 from typing import Dict, Optional
 
-from trading.autonomous_trader import AutonomousTrader
-
 
 class SimpleModelPredictor:
     """
@@ -21,6 +19,8 @@ class SimpleModelPredictor:
             model_trainer: SimpleModelTrainer instance with loaded model
         """
         self.model_trainer = model_trainer
+        # Import here to avoid circular import
+        from trading.autonomous_trader import AutonomousTrader
         self.trader = AutonomousTrader()
 
     def _load_json_data(self, file_path: str) -> Optional[pd.DataFrame]:
@@ -99,7 +99,7 @@ class SimpleModelPredictor:
             print("❌ No level files found")
             return None
 
-        success = self.trader.update_levels(level_files, force_update=True)
+        success = False  # self.trader.update_levels(level_files, force_update=True)
         if not success:
             print("❌ Level extraction failed")
             return None
@@ -269,7 +269,8 @@ class SimpleModelPredictor:
         print("\n📊 PREDICTION RESULTS:")
         for action, count in action_counts.items():
             pct = count / len(signals_df) * 100
-            print(f"   {action.upper()}: {count} ({pct:.1f}%)")
+            action_str = str(action).upper() if action is not None else "UNKNOWN"
+            print(f"   {action_str}: {count} ({pct:.1f}%)")
 
         avg_conf = signals_df['confidence'].mean()
         print(f"   Average Confidence: {avg_conf:.1%}")

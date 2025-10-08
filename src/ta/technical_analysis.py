@@ -11,12 +11,7 @@ Each middleware can process the data and add its own analysis results (such as p
 import pandas as pd
 from typing import List, Callable, Dict, Optional, Tuple, Literal
 from core.trading_types import ChartInterval
-
-# TypedDict is used for type-safe dictionaries (Python <3.8 compatibility)
-try:
-    from typing import TypedDict
-except ImportError:
-    from typing_extensions import TypedDict
+from typing import TypedDict
 
 
 # Type definitions for analysis results
@@ -43,8 +38,8 @@ LineType = Literal['zigzag',
                    'line_close_M', 'max_level_M', 'min_level_M'
                    ]
 
-# Line: (pivot1, pivot2, line_type)
-Line = Tuple[Pivot, Pivot, LineType]
+# Line: (pivot1, pivot2, line_type, volume)
+Line = Tuple[Pivot, Pivot, LineType, Optional[int]]  # Added int for strength or other metadata
 
 # VolumeProfileLine: ((bin_start, bin_end), bin_volume, normalized_volume)
 VolumeProfileLine = Tuple[Tuple[float, float], float, float]
@@ -69,7 +64,7 @@ class TechnicalAnalysisProcessor:
     Uses a middleware pattern to allow extensible analysis modules.
     """
 
-    def __init__(self, df: pd.DataFrame, time_frame: ChartInterval, useLogScale: bool = True):
+    def __init__(self, df: pd.DataFrame, time_frame: ChartInterval, last_pivot: Pivot, useLogScale: bool = True):
         """
         Initialize the processor with a pandas DataFrame containing candlestick data.
         Args:
@@ -77,22 +72,15 @@ class TechnicalAnalysisProcessor:
         """
         # Store the DataFrame
         self.df = df
-        # Validate and store the time frame (interval) of the data as ChartInterval
-        valid_intervals = [
-            '1m', '2m', '3m', '5m', '10m', '15m', '30m',
-            '1h', '2h', '4h', 'D', 'W', 'M'
-        ]
-        if time_frame not in valid_intervals:
-            raise ValueError(f"time_frame '{time_frame}' is not a valid ChartInterval")
-        self.time_frame: ChartInterval = time_frame  # type: ignore
+        self.time_frame: ChartInterval = time_frame
         # Whether to use logarithmic scale for price-based analyses
         self.useLogScale = useLogScale
         # List of middleware functions to apply
-        self.middlewares: List[Callable[[ChartInterval, pd.DataFrame, AnalysisDict, bool], AnalysisDict]] = []
-        # Stores the final analysis results
-        self.analysis: AnalysisDict = {}
+        self.middlewares: List[Callable[[ChartInterval, pd.DataFrame,  Pivot, AnalysisDict, bool], AnalysisDict]] = []
+        # Store the last pivot
+        self.last_pivot = last_pivot
 
-    def register_middleware(self, middleware: Callable[[ChartInterval, pd.DataFrame, AnalysisDict, bool], AnalysisDict]):
+    def register_middleware(self, middleware: Callable[[ChartInterval, pd.DataFrame, Pivot, AnalysisDict, bool], AnalysisDict]):
         """
         Register a middleware function for analysis.
         Args:
@@ -109,7 +97,7 @@ class TechnicalAnalysisProcessor:
         analysis: AnalysisDict = {}
         for middleware in self.middlewares:
             try:
-                result = middleware(self.time_frame, self.df, analysis, self.useLogScale)
+                result = middleware(self.time_frame, self.df, self.last_pivot, analysis, self.useLogScale)
                 # Each middleware should return {middleware_name: {lines: [], pivots: [], vp: []}}
                 for key, value in result.items():
                     analysis[key] = value
@@ -118,5 +106,4 @@ class TechnicalAnalysisProcessor:
                 print(f"Error occurred while processing middleware {middleware.__name__}: {e}")
                 pass
 
-        self.analysis = analysis
-        return self.analysis
+        return analysis

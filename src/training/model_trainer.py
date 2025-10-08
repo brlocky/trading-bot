@@ -2,78 +2,304 @@
 Simple Model Trainer - Main training interface for the trading system
 """
 
+import json
 import pandas as pd
 import numpy as np
 import os
 import joblib
 import time
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Union
+from datetime import datetime
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+from tqdm import tqdm
 import xgboost as xgb
 import warnings
 
-from detection.bounce_detector import BounceDetector
-from memory.trade_memory import TradeMemoryManager
-from training.autonomous_trainer import AutonomousTraderTrainer
-
+from trading.autonomous_trader import AutonomousTrader
 
 warnings.filterwarnings('ignore')
 
 
 class SimpleModelTrainer:
     """
-    Simple and clean model trainer for trading signals
+    Simple and clean model trainer for trading signals.
+
+    Uses AutonomousTrader as the single source of truth for feature calculation.
     """
 
     def __init__(self):
-        self.trainer = AutonomousTraderTrainer()
         self.model_data = {}
         self.is_trained = False
+        self.end_time: Optional[pd.Timestamp] = None
+        self.start_time: Optional[pd.Timestamp] = None
 
         # Default parameters
         self.profit_threshold = 2.0
         self.loss_threshold = -1.5
         self.lookforward_periods = [5, 10, 20]
-        self.model_path = 'src/models/simple_trading_model.joblib'
+        self.model_path = "src/models/simple_trading_model.joblib"
+        self.start_time: Optional[pd.Timestamp] = None
+        self.end_time: Optional[pd.Timestamp] = None
 
-        # Memory and bounce detection systems
-        self.trade_memory = TradeMemoryManager()
-        self.bounce_detector = BounceDetector()
+        # Initialize AutonomousTrader (SINGLE SOURCE OF TRUTH for features!)
+        # Uses hardcoded middleware and level extraction configurations
+        self.autonomous_trader = AutonomousTrader()
+
+        # Use AutonomousTrader's memory and bounce systems (no duplicates!)
+        self.trade_memory = self.autonomous_trader.trade_memory
+        self.bounce_detector = self.autonomous_trader.bounce_detector
         self.enable_memory_features = True
         self.enable_bounce_detection = True
 
-    def configure_training(self, profit_threshold: float = 2.0,
+    def configure_training(self,
+                           profit_threshold: float = 2.0,
                            loss_threshold: float = -1.5,
-                           lookforward_periods: List[int] = [5, 10, 20]):
-        """Configure training parameters"""
+                           lookforward_periods: List[int] = [5, 10, 20],
+                           start_time: Optional[pd.Timestamp] = None,
+                           end_time: Optional[pd.Timestamp] = None):
+        """
+        Configure training parameters and optional time range filtering
+
+        Args:
+            profit_threshold: Minimum % gain to label as BUY signal
+            loss_threshold: Maximum % loss to label as SELL signal
+            lookforward_periods: List of forward-looking periods for labels
+            start_time: Optional start timestamp to filter training data (inclusive)
+            end_time: Optional end timestamp to filter training data (inclusive)
+        """
         self.profit_threshold = profit_threshold
         self.loss_threshold = loss_threshold
         self.lookforward_periods = lookforward_periods
+        self.start_time = start_time
+        self.end_time = end_time
 
-        # Update trainer
-        self.trainer.profit_threshold = profit_threshold
-        self.trainer.loss_threshold = loss_threshold
-        self.trainer.lookforward_periods = lookforward_periods
+    def _load_dataframes_from_files(self, level_files: Dict[str, str]) -> Dict[str, pd.DataFrame]:
+        """
+        OPTIMIZED: Load all JSON files into DataFrames once (called at start of pre-computation).
 
-    def _prepare_training_data(self, main_file: str, level_files: Dict[str, str]) -> Tuple[Optional[pd.DataFrame], Optional[List[str]]]:
-        """Prepare and clean training data"""
-        print("📊 Preparing training data (optimized processing)...")
+        Args:
+            level_files: Dict of timeframe -> file path
+
+        Returns:
+            Dict of timeframe -> DataFrame
+        """
+
+        dataframes = {}
+        print("\n📂 PRE-LOADING ALL DATA FILES (one-time operation)...")
+
+        for timeframe, file_path in level_files.items():
+            try:
+                print(f"   Loading {timeframe}...", end='', flush=True)
+                with open(file_path, 'r') as f:
+                    json_data = json.load(f)
+
+                # Convert to DataFrame
+                candles = json_data.get('candles', [])
+                df_data = []
+                for candle in candles:
+                    df_data.append({
+                        'timestamp': pd.to_datetime(candle['time'], unit='s'),
+                        'open': float(candle['open']),
+                        'high': float(candle['high']),
+                        'low': float(candle['low']),
+                        'close': float(candle['close']),
+                        'volume': float(candle['volume']),
+                        'time': candle['time']
+                    })
+
+                df = pd.DataFrame(df_data)
+                df.set_index('timestamp', inplace=True)
+                dataframes[timeframe] = df
+
+                print(f" ✅ {len(df):,} candles")
+
+            except Exception as e:
+                print(f" ❌ Error: {e}")
+                raise e
+
+        print("✅ All data files loaded into memory!\n")
+        return dataframes
+
+    def _prepare_training_data(
+        self,
+        main_df: pd.DataFrame,
+        data_dfs: Dict[str, pd.DataFrame],
+        timeframe: str = '15m'
+    ) -> Tuple[Optional[pd.DataFrame], Optional[List[str]]]:
+
+        print("\n" + "=" * 70)
+        print("🚀 PREPARING TRAINING DATA (OPTIMIZED)")
+        print("=" * 70)
+        start_time = datetime.now()
 
         try:
-            # Get raw features and labels with parallel processing
-            features_df, labels_dict = self.trainer.prepare_training_data(main_file, level_files)
+            # ============================================================
+            # STEP 1: CALCULATE TA FEATURES FOR FULL DATASET (BEFORE FILTERING)
+            # ============================================================
+            # IMPORTANT: Calculate TA features on FULL historical data first
+            # This ensures lagging indicators (200 SMA, 100 EMA, etc.) have proper history
+            print(f"\n📈 Step 1/4: Calculating TA features for FULL dataset...")
+            print(f"   Using {len(main_df):,} candles (includes all historical data)")
+            ta_start = datetime.now()
+            
+            # Calculate TA features once for the FULL DataFrame (no time filter!)
+            ta_features_full = self.autonomous_trader._calculate_ta_features(
+                data=main_df,
+                timeframe=timeframe,
+                use_log_scale=True
+            )
+            
+            ta_time = (datetime.now() - ta_start).total_seconds()
+            print(f"   ✅ TA features calculated in {ta_time:.2f}s ({len(ta_features_full.columns)} features)")
+
+            # ============================================================
+            # STEP 2: FILTER DATA TO TRAINING RANGE
+            # ============================================================
+            print(f"\n📅 Step 2/4: Filtering to training time range...")
+            
+            # Now filter to the training time range
+            df = main_df
+            if self.start_time is not None:
+                df = df[df.index >= self.start_time]
+                print(f"   ⏰ Start time: {self.start_time}")
+
+            if self.end_time is not None:
+                df = df[df.index <= self.end_time]
+                print(f"   ⏰ End time: {self.end_time}")
+
+            if len(df) == 0:
+                print(f"❌ No data in specified time range! {main_df.index[0]} to {main_df.index[-1]}")
+                return None, None
+
+            print(f"   ✅ Training range: {len(df)} candles ({df.index[0]} to {df.index[-1]})")
+
+            # Filter TA features to match training range
+            ta_features_df = ta_features_full.loc[df.index]
+            print(f"   ✅ TA features filtered: {len(ta_features_df)} samples")
+
+            # ============================================================
+            # STEP 3: PRE-PROCESS LEVELS FOR TRAINING RANGE ONLY
+            # ============================================================
+            print(f"\n📊 Step 3/4: Pre-processing levels for {len(df)} candles...")
+            preprocess_start = datetime.now()
+            
+            all_levels = []
+            for i in range(len(df)):
+                current_price = df.close.iloc[i]
+                levels_raw = self.autonomous_trader.level_extractor.deserialize_levels_json(df['levels_json'].iloc[i])
+                levels = self.autonomous_trader.level_extractor.convert_raw_to_levelinfo(levels_raw, float(current_price))
+                all_levels.append(levels)
+            
+            preprocess_time = (datetime.now() - preprocess_start).total_seconds()
+            print(f"   ✅ Levels pre-processed in {preprocess_time:.2f}s")
+
+            # ============================================================
+            # STEP 2: CALCULATE TA FEATURES ONCE FOR ENTIRE DATAFRAME
+            # ============================================================
+            print(f"\n� Step 2/4: Calculating TA features for entire dataset...")
+            ta_start = datetime.now()
+            
+            # Calculate TA features once for the full DataFrame
+            ta_features_df = self.autonomous_trader._calculate_ta_features(
+                data=df,
+                timeframe=timeframe,
+                use_log_scale=True
+            )
+            
+            ta_time = (datetime.now() - ta_start).total_seconds()
+            print(f"   ✅ TA features calculated in {ta_time:.2f}s ({len(ta_features_df.columns)} features)")
+
+            # ============================================================
+            # STEP 3: CALCULATE LEVEL FEATURES PER CANDLE (FAST!)
+            # ============================================================
+            print("\n🎯 Step 3/4: Calculating level features per candle...")
+            level_start = datetime.now()
+            
+            from extraction.feature_engineer import LevelBasedFeatureEngineer
+            level_engineer = LevelBasedFeatureEngineer()
+            
+            all_level_features = []
+            for i in tqdm(range(len(df)), desc="Level features"):
+                current_price = df.close.iloc[i]
+                current_volume = df.volume.iloc[i]
+                levels = all_levels[i]  # Pre-processed levels (no JSON parsing!)
+                
+                # Calculate level features for SINGLE candle (fast!)
+                level_features_dict = level_engineer.create_level_features(
+                    current_price=float(current_price),
+                    current_volume=float(current_volume),
+                    levels=levels
+                )
+                
+                all_level_features.append(level_features_dict)
+            
+            # Convert list of dicts to DataFrame
+            level_features_df = pd.DataFrame(all_level_features, index=df.index)
+            
+            level_time = (datetime.now() - level_start).total_seconds()
+            print(f"   ✅ Level features calculated in {level_time:.2f}s ({len(level_features_df.columns)} features)")
+
+            # ============================================================
+            # STEP 4: ADD MEMORY FEATURES (ZEROS FOR TRAINING)
+            # ============================================================
+            print(f"\n💾 Step 4/4: Adding memory features...")
+            memory_start = datetime.now()
+            
+            # Create 10 memory feature columns filled with zeros
+            # (Memory features are for live trading alignment, not used in training)
+            memory_feature_names = [
+                'recent_trades', 'recent_wins', 'recent_losses', 
+                'avg_win_pct', 'avg_loss_pct', 'win_rate',
+                'avg_holding_periods', 'total_profit_loss',
+                'consecutive_wins', 'consecutive_losses'
+            ]
+            
+            memory_features_df = pd.DataFrame(
+                0.0, 
+                index=df.index, 
+                columns=memory_feature_names
+            )
+            
+            memory_time = (datetime.now() - memory_start).total_seconds()
+            print(f"   ✅ Memory features added in {memory_time:.3f}s ({len(memory_features_df.columns)} features)")
+
+            # ============================================================
+            # COMBINE ALL FEATURES
+            # ============================================================
+            print(f"\n🔗 Combining all feature groups...")
+            combine_start = datetime.now()
+            
+            features_df = pd.concat([
+                ta_features_df,
+                level_features_df,
+                memory_features_df
+            ], axis=1)
+            
+            combine_time = (datetime.now() - combine_start).total_seconds()
+            print(f"   ✅ Features combined in {combine_time:.3f}s")
 
             if features_df is None or len(features_df) == 0:
                 print("❌ No training data prepared")
                 return None, None
 
-            print(f"✅ Training data ready: {len(features_df)} samples, {len(features_df.columns)} features")
+            # Feature breakdown:
+            # - 45 TA features (from _calculate_ta_features)
+            # - 52 Level features (from _calculate_level_features)
+            # - 10 Memory features (zeros for alignment)
+            # = 107 total features
 
-            # ADD MEMORY-ENHANCED FEATURES
-            if self.enable_memory_features:
-                features_df = self._add_memory_features(features_df)
-                print(f"🧠 Memory features added: {len(features_df.columns)} total features")
+            print(f"\n✅ Features ready: {len(features_df)} samples, {len(features_df.columns)} features")
+            print(f"   TA: {len(ta_features_df.columns)}, Level: {len(level_features_df.columns)}, Memory: {len(memory_features_df.columns)}")
+
+            # Generate labels based on future price movements
+            print("🏷️  Generating trading labels...")
+            labels_dict = self._generate_labels(df)
+
+            # Align features with labels (features_df already has same index as df)
+            features_df = features_df.loc[df.index]
+
+            print(f"✅ Training data ready: {len(features_df)} samples, {len(features_df.columns)} features")
 
             # Clean NaN values
             total_nans = features_df.isnull().sum().sum()
@@ -107,56 +333,77 @@ class SimpleModelTrainer:
                 percentage = count/len(labels)*100
                 print(f"   {label}: {count} ({percentage:.1f}%)")
 
+            # Calculate and display total time taken
+            total_time = (datetime.now() - start_time).total_seconds()
+            print("\n" + "=" * 70)
+            print("✅ TRAINING DATA PREPARATION COMPLETE")
+            print("=" * 70)
+            print(f"⏱️  Total time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+            print(f"📊 Total samples: {len(features_df):,}")
+            print(f"📊 Total features: {len(features_df.columns)}")
+            print(f"⚡ Average time per sample: {total_time/len(features_df):.4f} seconds")
+            print("=" * 70 + "\n")
+
             return features_df, labels
 
         except Exception as e:
             print(f"❌ Data preparation error: {e}")
+            total_time = (datetime.now() - start_time).total_seconds()
+            print(f"⏱️  Failed after {total_time:.2f} seconds")
             return None, None
 
-    def _add_memory_features(self, features_df: pd.DataFrame) -> pd.DataFrame:
+    def _generate_labels(self, df: pd.DataFrame) -> Dict[str, List[int]]:
         """
-        ADD MEMORY-ENHANCED FEATURES
-        Add trade memory and market context features to improve predictions
+        Generate trading labels based on future price movements.
+
+        Args:
+            df: DataFrame with OHLCV data
+
+        Returns:
+            Dict with 'buy' and 'sell' signal lists
         """
-        print("🧠 Adding memory-enhanced features...")
+        print("🏷️  Generating labels based on price movements...")
 
-        # Get current trade memory stats
-        recent_perf = self.trade_memory.get_recent_performance()
-        bounce_perf = self.trade_memory.get_bounce_performance()
-        consecutive = self.trade_memory.get_consecutive_performance()
+        buy_signals = []
+        sell_signals = []
 
-        num_samples = len(features_df)
+        closes = df['close'].values
 
-        # Memory features (same for all samples during training)
-        memory_features = pd.DataFrame({
-            # Recent performance memory
-            'memory_win_rate': [recent_perf['win_rate']] * num_samples,
-            'memory_avg_pnl': [recent_perf['avg_pnl']] * num_samples,
-            'memory_total_trades': [recent_perf['total_trades']] * num_samples,
+        for i in range(len(df)):
+            buy_signal = 0
+            sell_signal = 0
 
-            # Bounce-specific memory
-            'bounce_win_rate': [bounce_perf['bounce_win_rate']] * num_samples,
-            'bounce_avg_pnl': [bounce_perf['bounce_avg_pnl']] * num_samples,
-            'bounce_trade_count': [bounce_perf['bounce_trades']] * num_samples,
+            # Look forward to see if price moves significantly
+            for period in self.lookforward_periods:
+                if i + period < len(closes):
+                    future_price = closes[i + period]
+                    current_price = closes[i]
+                    pct_change = ((future_price - current_price) / current_price) * 100
 
-            # Consecutive performance
-            'consecutive_wins': [max(0, consecutive)] * num_samples,
-            'consecutive_losses': [max(0, -consecutive)] * num_samples,
+                    # Check if profit threshold met
+                    if pct_change >= self.profit_threshold:
+                        buy_signal = 1
+                        break
+                    # Check if loss threshold met
+                    elif pct_change <= self.loss_threshold:
+                        sell_signal = 1
+                        break
 
-            # Market context features (simulated for training, real for testing)
-            'market_volatility_regime': np.random.uniform(0.1, 2.0, num_samples),
-            'trend_strength': np.random.uniform(-1.0, 1.0, num_samples),
-        })
+            buy_signals.append(buy_signal)
+            sell_signals.append(sell_signal)
 
-        # Combine with existing features
-        enhanced_features = pd.concat([features_df, memory_features], axis=1)
+        buy_count = sum(buy_signals)
+        sell_count = sum(sell_signals)
+        hold_count = len(buy_signals) - buy_count - sell_count
 
-        print(f"   ✅ Added {len(memory_features.columns)} memory features")
-        print(f"   📊 Win Rate: {recent_perf['win_rate']:.1%} | Avg PnL: {recent_perf['avg_pnl']:.2f}%")
-        print(f"   🎯 Bounce Win Rate: {bounce_perf['bounce_win_rate']:.1%}")
-        print(f"   🔥 Consecutive: {consecutive} {'wins' if consecutive > 0 else 'losses' if consecutive < 0 else 'neutral'}")
+        print(f"   BUY signals: {buy_count} ({buy_count/len(buy_signals)*100:.1f}%)")
+        print(f"   SELL signals: {sell_count} ({sell_count/len(sell_signals)*100:.1f}%)")
+        print(f"   HOLD signals: {hold_count} ({hold_count/len(buy_signals)*100:.1f}%)")
 
-        return enhanced_features
+        return {'buy': buy_signals, 'sell': sell_signals}
+
+    # Note: _add_memory_features() was removed - memory features now come from
+    # AutonomousTrader.get_all_features() automatically
 
     def _detect_gpu(self) -> bool:
         """Detect if GPU is available"""
@@ -176,10 +423,10 @@ class SimpleModelTrainer:
         if not gpu_available:
             raise RuntimeError("❌ GPU not available! Training requires GPU. Please ensure NVIDIA GPU and drivers are properly installed.")
 
-        results = {'training_time': None, 'device': 'GPU'}
+        results: Dict[str, Union[float, str, None]] = {'training_time': None, 'device': 'GPU'}
 
         print("   🚀 Training with GPU...")
-        start_time = time.time()
+        train_start_time = time.time()
 
         # OPTIMIZED THREADING: Using 8 threads for 8-core system
         model = xgb.XGBClassifier(
@@ -189,7 +436,7 @@ class SimpleModelTrainer:
         )
 
         model.fit(X_train, y_train_encoded)
-        training_time = time.time() - start_time
+        training_time = time.time() - train_start_time
 
         accuracy = model.score(X_test, y_test_encoded)
         print(f"     ✅ GPU Training Complete: {training_time:.2f}s | Accuracy: {accuracy:.1%}")
@@ -199,20 +446,68 @@ class SimpleModelTrainer:
 
         return model, model_type, results
 
-    def train_model(self, training_files: Dict[str, str], level_timeframes: List[str] = ['M', 'W', 'D', '1h']) -> bool:
+    def train_model(self, training_files: Dict[str, str], level_timeframes: List[str] = ['M', 'W', 'D', '1h', '15m']) -> bool:
         """Train the model with the given files"""
         print("🎓 TRAINING MODEL")
         print("=" * 30)
+        time_frame_to_train = '15m'
 
-        # Prepare level files
-        level_files = {tf: training_files[tf] for tf in level_timeframes if tf in training_files}
-        main_file = training_files['15m']  # Use 15m as main timeframe
+        # Validate all required files exist
+        print("\n📋 Validating training files...")
 
-        print("Main timeframe: 15m")
-        print(f"Level timeframes: {list(level_files.keys())}")
+        # Check main training file
+        main_file = training_files.get(time_frame_to_train)
+        if not main_file:
+            raise ValueError(f"Main training timeframe '{time_frame_to_train}' not found in training_files")
+
+        if not os.path.exists(main_file):
+            raise FileNotFoundError(f"Main training file not found at {main_file}")
+
+        print(f"   ✅ Main file ({time_frame_to_train}): {main_file}")
+
+        # Check parquet file
+        parquet_path = training_files.get('parquet_path')
+        if not parquet_path:
+            raise ValueError("'parquet_path' not found in training_files")
+
+        print(f"   ✅ Parquet file: {parquet_path}")
+
+        # Check all level timeframe files
+        print(f"\n📊 Validating level timeframes: {level_timeframes}")
+        missing_files = []
+        level_files = {}
+
+        for tf in level_timeframes:
+            if tf not in training_files:
+                missing_files.append(f"{tf} (not in training_files dict)")
+                continue
+
+            file_path = training_files[tf]
+            if not os.path.exists(file_path):
+                missing_files.append(f"{tf} (file not found: {file_path})")
+            else:
+                level_files[tf] = file_path
+                print(f"   ✅ {tf}: {file_path}")
+
+        # Report any missing files (after checking ALL timeframes)
+        if missing_files:
+            print("\n❌ Missing required files:")
+            for missing in missing_files:
+                print(f"   • {missing}")
+            raise FileNotFoundError(f"Missing {len(missing_files)} required level timeframe file(s)")
+
+        print(f"\n✅ All {len(level_files)} level timeframe files validated!")
+        print(f"   Level timeframes: {list(level_files.keys())}")
+
+        print("\n📦 Loading precomputed features from parquet...")
+        main_df = self.autonomous_trader.level_extractor.load_precomputed_levels(parquet_path)
+        print(f"   ✅ Loaded {len(main_df):,} candles from precomputed parquet")
+
+        print("\n📂 Loading level timeframe data...")
+        data_dfs = self._load_dataframes_from_files(level_files)
 
         # Prepare data
-        features_df, labels = self._prepare_training_data(main_file, level_files)
+        features_df, labels = self._prepare_training_data(main_df, data_dfs, timeframe=time_frame_to_train)
         if features_df is None or labels is None:
             return False
 
@@ -223,8 +518,8 @@ class SimpleModelTrainer:
 
         # Encode labels
         label_encoder = LabelEncoder()
-        y_train_encoded = label_encoder.fit_transform(y_train)
-        y_test_encoded = label_encoder.transform(y_test)
+        y_train_encoded = np.asarray(label_encoder.fit_transform(y_train))
+        y_test_encoded = np.asarray(label_encoder.transform(y_test))
 
         print(f"🔥 Training with {len(X_train)} samples, {len(X_train.columns)} features")
 
