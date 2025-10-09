@@ -275,9 +275,31 @@ class VectorBTBacktester:
         for j, class_name in enumerate(classes):
             signals_df[f'{class_name}_prob'] = probabilities[:, j]
 
+        # Support both 3-class and 5-class models
+        if 'buy_prob' not in signals_df.columns:
+            # 5-class model: aggregate strong + weak probabilities
+            buy_strong = signals_df.get('buy_strong_prob', pd.Series(0.0, index=signals_df.index))
+            buy_weak = signals_df.get('buy_weak_prob', pd.Series(0.0, index=signals_df.index))
+            sell_strong = signals_df.get('sell_strong_prob', pd.Series(0.0, index=signals_df.index))
+            sell_weak = signals_df.get('sell_weak_prob', pd.Series(0.0, index=signals_df.index))
+
+            buy_prob = buy_strong + buy_weak
+            sell_prob = sell_strong + sell_weak
+
+            signals_df['buy_prob'] = buy_prob
+            signals_df['sell_prob'] = sell_prob
+
+            print(f"\n🔍 5-Class Model Detected - Aggregating probabilities:")
+            print(f"   BUY = buy_strong + buy_weak")
+            print(f"   SELL = sell_strong + sell_weak")
+            print(f"   Max BUY prob: {buy_prob.max():.4f}")
+            print(f"   Max SELL prob: {sell_prob.max():.4f}")
+        else:
+            # 3-class model: use existing probabilities
+            buy_prob = signals_df['buy_prob']
+            sell_prob = signals_df['sell_prob']
+
         # Determine signals based on thresholds
-        buy_prob = signals_df.get('buy_prob', pd.Series(0.0, index=signals_df.index))
-        sell_prob = signals_df.get('sell_prob', pd.Series(0.0, index=signals_df.index))
         hold_prob = signals_df.get('hold_prob', pd.Series(0.0, index=signals_df.index))
 
         # Apply thresholds
@@ -534,9 +556,29 @@ class VectorBTBacktester:
         for j, class_name in enumerate(classes):
             signals_df[f'{class_name}_prob'] = probabilities[:, j]
 
+        # Support both 3-class and 5-class models
+        if 'buy_prob' not in signals_df.columns:
+            # 5-class model: aggregate strong + weak probabilities
+            buy_strong = signals_df.get('buy_strong_prob', pd.Series(0.0, index=signals_df.index))
+            buy_weak = signals_df.get('buy_weak_prob', pd.Series(0.0, index=signals_df.index))
+            sell_strong = signals_df.get('sell_strong_prob', pd.Series(0.0, index=signals_df.index))
+            sell_weak = signals_df.get('sell_weak_prob', pd.Series(0.0, index=signals_df.index))
+
+            buy_prob = buy_strong + buy_weak
+            sell_prob = sell_strong + sell_weak
+
+            signals_df['buy_prob'] = buy_prob
+            signals_df['sell_prob'] = sell_prob
+
+            print("\n🔍 5-Class Model Detected - Aggregating probabilities:")
+            print(f"   Max BUY prob: {buy_prob.max():.4f}")
+            print(f"   Max SELL prob: {sell_prob.max():.4f}")
+        else:
+            # 3-class model: use existing probabilities
+            buy_prob = signals_df['buy_prob']
+            sell_prob = signals_df['sell_prob']
+
         # Determine signals based on thresholds
-        buy_prob = signals_df.get('buy_prob', pd.Series(0.0, index=signals_df.index))
-        sell_prob = signals_df.get('sell_prob', pd.Series(0.0, index=signals_df.index))
         hold_prob = signals_df.get('hold_prob', pd.Series(0.0, index=signals_df.index))
 
         # Apply thresholds

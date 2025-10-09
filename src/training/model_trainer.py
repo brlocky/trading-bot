@@ -262,9 +262,14 @@ class SimpleModelTrainer:
             print(f"\n✅ Features ready: {len(features_df)} samples, {len(features_df.columns)} features")
             print(f"   TA: {len(ta_features_df.columns)}, Level: {len(level_features_df.columns)}, Memory: {len(memory_features_df.columns)}")
 
-            # Generate labels based on future price movements
-            print("🏷️  Generating trading labels...")
-            labels_dict = self._generate_labels(df)
+            # Generate labels based on future price movements + TA/level context
+            print("🏷️  Generating trading labels with quality scores...")
+            labels_dict = self._generate_labels_with_quality(
+                df=df,
+                ta_features=ta_features_df,
+                level_features=level_features_df,
+                all_levels=all_levels
+            )
 
             # Align features with labels (features_df already has same index as df)
             features_df = features_df.loc[df.index]
@@ -283,16 +288,20 @@ class SimpleModelTrainer:
                 print(f"🧹 Cleaning {inf_count} infinite values...")
                 features_df = features_df.replace([np.inf, -np.inf], 0)
 
-            # Convert labels
+            # Convert labels (now with quality scores: 0=hold, 1=low quality, 2=high quality)
             labels = []
             for i in range(len(features_df)):
                 buy_signal = labels_dict['buy'][i]
                 sell_signal = labels_dict['sell'][i]
 
-                if buy_signal == 1:
-                    labels.append('buy')
+                if buy_signal == 2:
+                    labels.append('buy_strong')  # High quality BUY
+                elif buy_signal == 1:
+                    labels.append('buy_weak')    # Low quality BUY
+                elif sell_signal == 2:
+                    labels.append('sell_strong')  # High quality SELL
                 elif sell_signal == 1:
-                    labels.append('sell')
+                    labels.append('sell_weak')   # Low quality SELL
                 else:
                     labels.append('hold')
 
@@ -322,52 +331,186 @@ class SimpleModelTrainer:
             print(f"⏱️  Failed after {total_time:.2f} seconds")
             return None, None
 
-    def _generate_labels(self, df: pd.DataFrame) -> Dict[str, List[int]]:
+    def _generate_labels_with_quality(
+        self,
+        df: pd.DataFrame,
+        ta_features: pd.DataFrame,
+        level_features: pd.DataFrame,
+        all_levels: List
+    ) -> Dict[str, List[int]]:
         """
-        Generate trading labels based on future price movements.
+        Generate trading labels with quality scores based on:
+        1. Future price movements (like old method)
+        2. TA confluence (RSI, trend alignment)
+        3. Level confluence (support/resistance proximity)
+        4. Risk/Reward ratio (TP from volume profile, SL from pivots)
 
         Args:
             df: DataFrame with OHLCV data
+            ta_features: TA features DataFrame
+            level_features: Level features DataFrame
+            all_levels: Pre-processed levels per candle
 
         Returns:
-            Dict with 'buy' and 'sell' signal lists
+            Dict with 'buy', 'sell' signal lists (0=hold, 1=low quality, 2=high quality)
         """
-        print("🏷️  Generating labels based on price movements...")
+        print("🏷️  Generating quality-scored labels...")
 
         buy_signals = []
         sell_signals = []
 
         closes = df['close'].values
+        highs = df['high'].values
+        lows = df['low'].values
 
-        for i in range(len(df)):
+        # Quality thresholds
+        MIN_QUALITY = 0.4  # Minimum quality to label as buy/sell
+        HIGH_QUALITY_THRESHOLD = 0.55  # Threshold for high-quality label (lowered from 0.7 - max observed quality is 0.533)
+        MIN_RR_RATIO = 1.5  # Minimum risk/reward ratio
+
+        for i in tqdm(range(len(df)), desc="Quality labels"):
             buy_signal = 0
             sell_signal = 0
 
-            # Look forward to see if price moves significantly
+            current_price = closes[i]
+            current_high = highs[i]
+            current_low = lows[i]
+
+            # ============================================================
+            # STEP 1: Check if price moves significantly (original logic)
+            # ============================================================
+            price_hit_profit = False
+            price_hit_loss = False
+
             for period in self.lookforward_periods:
                 if i + period < len(closes):
                     future_price = closes[i + period]
-                    current_price = closes[i]
                     pct_change = ((future_price - current_price) / current_price) * 100
 
-                    # Check if profit threshold met
                     if pct_change >= self.profit_threshold:
-                        buy_signal = 1
+                        price_hit_profit = True
                         break
-                    # Check if loss threshold met
                     elif pct_change <= self.loss_threshold:
-                        sell_signal = 1
+                        price_hit_loss = True
                         break
+
+            # Skip if no significant price movement
+            if not price_hit_profit and not price_hit_loss:
+                buy_signals.append(0)
+                sell_signals.append(0)
+                continue
+
+            # ============================================================
+            # STEP 2-5: Use BounceDetector for ALL quality calculations
+            # ============================================================
+            try:
+                # Flatten all_levels dict to list
+                all_level_list = []
+                if isinstance(all_levels[i], dict):
+                    for tf_levels in all_levels[i].values():
+                        all_level_list.extend(tf_levels)
+                else:
+                    all_level_list = all_levels[i]
+
+                signal_type = 'BUY' if price_hit_profit else 'SELL'
+
+                # Get RSI for quality calculation
+                rsi = ta_features['rsi'].iloc[i] if 'rsi' in ta_features.columns else 50.0
+
+                # === SINGLE SOURCE OF TRUTH: BounceDetector ===
+                # Calculates quality score including:
+                # - Level proximity (30%)
+                # - RSI confluence (20%)
+                # - Level strength (20%)
+                # - MACD alignment (optional, via TA features)
+                # - BB position (optional, via TA features)
+                base_quality = self.bounce_detector.calculate_labeling_quality(
+                    current_price=current_price,
+                    levels=all_level_list,
+                    signal_type=signal_type,
+                    rsi=rsi
+                )
+
+                # Add MACD confluence bonus (10% weight)
+                macd_bonus = 0.0
+                if 'macd' in ta_features.columns and 'macd_signal' in ta_features.columns:
+                    macd = ta_features['macd'].iloc[i]
+                    macd_signal = ta_features['macd_signal'].iloc[i]
+
+                    if signal_type == 'BUY' and macd > macd_signal:
+                        macd_bonus = 0.1
+                    elif signal_type == 'SELL' and macd < macd_signal:
+                        macd_bonus = 0.1
+
+                # Add Bollinger Bands confluence bonus (10% weight)
+                bb_bonus = 0.0
+                if 'bb_position' in ta_features.columns:
+                    bb_pos = ta_features['bb_position'].iloc[i]
+                    if signal_type == 'BUY' and bb_pos < 0.3:
+                        bb_bonus = 0.1
+                    elif signal_type == 'SELL' and bb_pos > 0.7:
+                        bb_bonus = 0.1
+
+                # Calculate R/R ratio quality (30% weight)
+                rr_quality = 0.0
+                sl_price = self.bounce_detector.find_pivot_stop_loss(
+                    current_price, all_level_list, signal_type
+                )
+                tp_price = self.bounce_detector.find_volume_profile_target(
+                    current_price, all_level_list, signal_type
+                )
+
+                if sl_price and tp_price:
+                    sl_dist = abs(current_price - sl_price)
+                    tp_dist = abs(tp_price - current_price)
+
+                    if sl_dist > 0:
+                        rr_ratio = tp_dist / sl_dist
+
+                        if rr_ratio >= 3.0:
+                            rr_quality = 1.0
+                        elif rr_ratio >= 2.0:
+                            rr_quality = 0.8
+                        elif rr_ratio >= MIN_RR_RATIO:
+                            rr_quality = 0.6
+                        else:
+                            rr_quality = 0.3
+                    else:
+                        rr_quality = 0.5
+                else:
+                    rr_quality = 0.5
+
+                # Final quality = Base (60%) + TA Bonuses (10%) + R/R (30%)
+                total_quality = (base_quality * 0.6) + macd_bonus + bb_bonus + (rr_quality * 0.3)
+
+            except Exception:
+                print("❌ Quality calculation error, defaulting to 0.0")
+                total_quality = 0.0  # Fallback if calculation fails
+
+            # Generate final signal based on quality
+            if price_hit_profit and total_quality >= MIN_QUALITY:
+                if total_quality >= HIGH_QUALITY_THRESHOLD:
+                    buy_signal = 2  # High quality BUY
+                else:
+                    buy_signal = 1  # Low quality BUY
+            elif price_hit_loss and total_quality >= MIN_QUALITY:
+                if total_quality >= HIGH_QUALITY_THRESHOLD:
+                    sell_signal = 2  # High quality SELL
+                else:
+                    sell_signal = 1  # Low quality SELL
 
             buy_signals.append(buy_signal)
             sell_signals.append(sell_signal)
 
-        buy_count = sum(buy_signals)
-        sell_count = sum(sell_signals)
+        # Count signal distribution
+        buy_count = sum(1 for s in buy_signals if s > 0)
+        buy_high_quality = sum(1 for s in buy_signals if s == 2)
+        sell_count = sum(1 for s in sell_signals if s > 0)
+        sell_high_quality = sum(1 for s in sell_signals if s == 2)
         hold_count = len(buy_signals) - buy_count - sell_count
 
-        print(f"   BUY signals: {buy_count} ({buy_count/len(buy_signals)*100:.1f}%)")
-        print(f"   SELL signals: {sell_count} ({sell_count/len(sell_signals)*100:.1f}%)")
+        print(f"   BUY signals: {buy_count} ({buy_count/len(buy_signals)*100:.1f}%) | High quality: {buy_high_quality}")
+        print(f"   SELL signals: {sell_count} ({sell_count/len(sell_signals)*100:.1f}%) | High quality: {sell_high_quality}")
         print(f"   HOLD signals: {hold_count} ({hold_count/len(buy_signals)*100:.1f}%)")
 
         return {'buy': buy_signals, 'sell': sell_signals}
