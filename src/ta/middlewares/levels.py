@@ -42,82 +42,153 @@ def levels_middleware(
     opens = price_data['open'].values
     volumes = price_data['volume'].values
 
-    # 1. Find untouched closes (includes special handling for last 2 candles with same close/open)
-    untouched_closes = find_untouched_closes(time_frame, times, closes, highs, lows, opens, volumes)
+    # 1. Find untouched closes with early stopping optimization
+    # Process from newest to oldest and stop when we have enough levels
+    untouched_closes = find_untouched_closes_optimized(
+        time_frame, times, closes, highs, lows, opens, volumes, last_Pivot,
+        max_above=4, max_below=2
+    )
 
     # Create horizontal lines for untouched closes
     for close_time, close_price, volume in untouched_closes:
         end_time = times[-1]
         # Create horizontal line as two pivots with same price
-        start_pivot = (close_time, close_price, None)  # Type doesn't matter for horizontal lines
-        end_pivot = (end_time, close_price, None)
+        start_pivot = (close_time, close_price, volume, None)  # Type doesn't matter for horizontal lines
+        end_pivot = (end_time, close_price, volume, None)
 
         line_type = cast(LineType, f'line_close_{time_frame}')  # Cast string to LineType
         levels_lines.append((start_pivot, end_pivot, line_type, volume))
 
-    # Filter and select top levels based on volume and proximity to last pivot
-    filtered_lines = filter_top_levels(levels_lines, last_Pivot)
-
-    return {'levels': {'lines': filtered_lines}}
+    # No filtering needed - already optimized during detection
+    return {'levels': {'lines': levels_lines}}
 
 
-def filter_top_levels(levels_lines: List[Line], last_pivot: Pivot, top_strong: int = 5, top_close: int = 5) -> List[Line]:
+def filter_top_levels(levels_lines: List[Line], last_pivot: Pivot, top_above: int = 4, top_below: int = 2) -> List[Line]:
     """
-    Filter levels to show only:
-    - Top 5 strongest levels (by volume)
-    - Top 5 closest levels to last pivot price (from remaining levels)
+    Filter levels to show only the closest levels relative to last pivot price:
+    - 4 closest lines ABOVE the last pivot price
+    - 2 closest lines BELOW the last pivot price
+
+    Maximum of 6 lines total (4 above + 2 below)
 
     Args:
         levels_lines: List of all detected level lines (start_pivot, end_pivot, line_type, volume)
-        last_pivot: Last pivot point (timestamp, price, type)
-        top_strong: Number of strongest levels to include (default: 5)
-        top_close: Number of closest levels to include (default: 5)
+        last_pivot: Last pivot point (timestamp, price, volume, type)
+        top_above: Number of closest levels above to include (default: 4)
+        top_below: Number of closest levels below to include (default: 2)
 
     Returns:
-        List[Line]: Filtered list of up to 10 levels
+        List[Line]: Filtered list of up to 6 levels (4 above, 2 below)
     """
     if not levels_lines:
         return []
 
-    # Extract last pivot price once
+    # Extract last pivot price
     last_pivot_price = last_pivot[1]
 
-    # 1. Sort by volume (descending) and get top 5 strongest
-    sorted_by_volume = sorted(levels_lines, key=lambda x: x[3] or 0, reverse=True)
-    top_5_strongest = sorted_by_volume[:top_strong]
+    # Separate levels into above and below current price
+    levels_above = []
+    levels_below = []
 
-    # 2. For remaining levels, find closest to current price
-    # Use simple exclusion by comparing objects directly
-    remaining_levels = []
     for level in levels_lines:
-        # Check if this level is NOT in top_5_strongest
-        is_in_strongest = False
-        for strong_level in top_5_strongest:
-            if (level[0] == strong_level[0] and  # Same start pivot
-                    level[1] == strong_level[1] and  # Same end pivot
-                    level[2] == strong_level[2]):    # Same line type
-                is_in_strongest = True
-                break
+        level_price = level[0][1]  # Get price from start pivot
 
-        if not is_in_strongest:
-            remaining_levels.append(level)
+        if level_price > last_pivot_price:
+            levels_above.append(level)
+        elif level_price < last_pivot_price:
+            levels_below.append(level)
+        # Skip levels exactly at current price
 
-    # Sort remaining by distance to pivot price
-    sorted_by_distance = sorted(
-        remaining_levels,
-        key=lambda x: abs(x[0][1] - last_pivot_price)
-    )
+    # Sort above levels by price (ascending) - closest first
+    levels_above.sort(key=lambda x: x[0][1])
 
-    # Get top 5 closest
-    top_5_closest = sorted_by_distance[:top_close]
+    # Sort below levels by price (descending) - closest first
+    levels_below.sort(key=lambda x: x[0][1], reverse=True)
+
+    # Get top N closest from each group
+    closest_above = levels_above[:top_above]
+    closest_below = levels_below[:top_below]
 
     # Combine and return
-    return top_5_strongest + top_5_closest
+    return closest_below + closest_above
+
+
+def find_untouched_closes_optimized(
+    time_frame: ChartInterval, times, closes, highs, lows, opens, volumes,
+    last_pivot: Pivot, max_above: int = 4, max_below: int = 2
+) -> List[tuple]:
+    """
+    Find close prices that were never revisited (untouched).
+    OPTIMIZED: Processes candles from newest to oldest and stops early once enough levels found.
+
+    Only detects levels when:
+    - There is a color change between consecutive candles
+    - AND the close of first candle == open of second candle
+
+    Args:
+        time_frame: Chart interval
+        times: Array of timestamps
+        closes: Array of close prices
+        highs: Array of high prices
+        lows: Array of low prices
+        opens: Array of open prices
+        volumes: Array of volumes
+        last_pivot: Last pivot point to determine current price
+        max_above: Maximum number of levels above current price to find
+        max_below: Maximum number of levels below current price to find
+
+    Returns:
+        List of (timestamp, price, volume) tuples for untouched closes
+    """
+    untouched_above = []
+    untouched_below = []
+    n_candles = len(closes)
+    current_price = last_pivot[1]
+
+    # Process candles from newest to oldest (reverse order)
+    # Start from n_candles - 2 since we check i+1
+    for i in range(n_candles - 2, -1, -1):
+        # Early stopping: if we have enough levels on both sides, stop processing
+        if len(untouched_above) >= max_above and len(untouched_below) >= max_below:
+            break
+
+        close_price = closes[i]
+        open_price = opens[i]
+        close_time = times[i]
+        close_volume = volumes[i]
+
+        # Get next candle data
+        next_open = opens[i + 1]
+        next_close = closes[i + 1]
+
+        # Check if close of current candle == open of next candle
+        if abs(close_price - next_open) < 1e-8:
+            # Determine candle colors
+            current_is_green = close_price > open_price
+            next_is_green = next_close > next_open
+
+            # Only create level if there's a color change
+            if current_is_green != next_is_green:
+                # Check if this level gets touched by future candles
+                is_touched = _check_level_touched_consecutive(
+                    i, close_price, highs, lows, n_candles
+                )
+
+                if not is_touched:
+                    # Separate into above/below based on current price
+                    if close_price > current_price and len(untouched_above) < max_above:
+                        untouched_above.append((close_time, close_price, close_volume))
+                    elif close_price < current_price and len(untouched_below) < max_below:
+                        untouched_below.append((close_time, close_price, close_volume))
+
+    # Combine results (already limited by max counts)
+    return untouched_below + untouched_above
 
 
 def find_untouched_closes(time_frame: ChartInterval, times, closes, highs, lows, opens, volumes) -> List[tuple]:
     """
     Find close prices that were never revisited (untouched).
+    DEPRECATED: Use find_untouched_closes_optimized instead for better performance.
 
     Only detects levels when:
     - There is a color change between consecutive candles

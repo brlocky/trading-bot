@@ -75,39 +75,38 @@ class AutonomousTrader:
             'M': {
                 'middlewares': [zigzag_middleware, levels_middleware, channels_middleware],
                 'extract': {
-                    'zigzag': ['pivots'],
+                    # 'zigzag': ['pivots'],  # Show all zigzag pivots for analysis
                     'levels': ['lines'],
-                    'channels': ['lines'],
+                    'channels': ['lines'],  # Channel lines only
                 }
             },
             'W': {
-                'middlewares': [zigzag_middleware, levels_middleware, channels_middleware],
+                'middlewares': [zigzag_middleware, levels_middleware, volume_profile_middleware],
                 'extract': {
-                    'zigzag': ['pivots'],
+                    # 'zigzag': ['pivots'],  # Show all zigzag pivots for analysis
                     'levels': ['lines'],
-                    'channels': ['lines'],
+                    'volume_profile_periods': ['lines']
                 }
             },
             'D': {
-                'middlewares': [zigzag_middleware, levels_middleware, channels_middleware],
+                'middlewares': [zigzag_middleware, levels_middleware, volume_profile_middleware],
                 'extract': {
-                    'zigzag': ['pivots'],
+                    # 'zigzag': ['pivots'],  # Show all zigzag pivots for analysis
                     'levels': ['lines'],
-                    'channels': ['lines'],
+                    'volume_profile_periods': ['lines']
                 }
             },
             '1h': {
-                'middlewares': [zigzag_middleware, channels_middleware],
+                'middlewares': [zigzag_middleware, volume_profile_middleware],
                 'extract': {
-                    'zigzag': ['pivots', 'lines'],
-                    'channels': ['lines'],
+                    'zigzag': ['pivots'],
+                    'volume_profile_periods': ['lines']
                 }
             },
             '15m': {
-                'middlewares': [zigzag_middleware, levels_middleware, channels_middleware, volume_profile_middleware],
+                'middlewares': [zigzag_middleware, volume_profile_middleware],
                 'extract': {
-                    'zigzag': ['pivots'],
-                    'channels': ['lines'],
+                    # 'zigzag': ['pivots'],
                     'volume_profile_periods': ['lines']
                 }
             }

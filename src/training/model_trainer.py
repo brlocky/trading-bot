@@ -2,7 +2,6 @@
 Simple Model Trainer - Main training interface for the trading system
 """
 
-import json
 import pandas as pd
 import numpy as np
 import os
@@ -76,7 +75,7 @@ class SimpleModelTrainer:
 
     def _load_dataframes_from_files(self, level_files: Dict[str, str]) -> Dict[str, pd.DataFrame]:
         """
-        OPTIMIZED: Load all JSON files into DataFrames once (called at start of pre-computation).
+        Load all JSON files into DataFrames using centralized DataLoader.
 
         Args:
             level_files: Dict of timeframe -> file path
@@ -84,42 +83,13 @@ class SimpleModelTrainer:
         Returns:
             Dict of timeframe -> DataFrame
         """
+        from training.data_loader import DataLoader
 
-        dataframes = {}
-        print("\n📂 PRE-LOADING ALL DATA FILES (one-time operation)...")
-
-        for timeframe, file_path in level_files.items():
-            try:
-                print(f"   Loading {timeframe}...", end='', flush=True)
-                with open(file_path, 'r') as f:
-                    json_data = json.load(f)
-
-                # Convert to DataFrame
-                candles = json_data.get('candles', [])
-                df_data = []
-                for candle in candles:
-                    df_data.append({
-                        'timestamp': pd.to_datetime(candle['time'], unit='s'),
-                        'open': float(candle['open']),
-                        'high': float(candle['high']),
-                        'low': float(candle['low']),
-                        'close': float(candle['close']),
-                        'volume': float(candle['volume']),
-                        'time': candle['time']
-                    })
-
-                df = pd.DataFrame(df_data)
-                df.set_index('timestamp', inplace=True)
-                dataframes[timeframe] = df
-
-                print(f" ✅ {len(df):,} candles")
-
-            except Exception as e:
-                print(f" ❌ Error: {e}")
-                raise e
-
-        print("✅ All data files loaded into memory!\n")
-        return dataframes
+        return DataLoader.load_multiple_json_files(
+            level_files,
+            exclude_keys=['parquet_path'],
+            set_timestamp_index=True
+        )
 
     def _prepare_training_data(
         self,
@@ -139,17 +109,17 @@ class SimpleModelTrainer:
             # ============================================================
             # IMPORTANT: Calculate TA features on FULL historical data first
             # This ensures lagging indicators (200 SMA, 100 EMA, etc.) have proper history
-            print(f"\n📈 Step 1/4: Calculating TA features for FULL dataset...")
-            print(f"   Using {len(main_df):,} candles (includes all historical data)")
+            print("\n📈 Step 1/4: Calculating TA features for FULL dataset...")
+            print("   Using {len(main_df):,} candles (includes all historical data)")
             ta_start = datetime.now()
-            
+
             # Calculate TA features once for the FULL DataFrame (no time filter!)
             ta_features_full = self.autonomous_trader._calculate_ta_features(
                 data=main_df,
                 timeframe=timeframe,
                 use_log_scale=True
             )
-            
+
             ta_time = (datetime.now() - ta_start).total_seconds()
             print(f"   ✅ TA features calculated in {ta_time:.2f}s ({len(ta_features_full.columns)} features)")
 
@@ -157,7 +127,7 @@ class SimpleModelTrainer:
             # STEP 2: FILTER DATA TO TRAINING RANGE
             # ============================================================
             print(f"\n📅 Step 2/4: Filtering to training time range...")
-            
+
             # Now filter to the training time range
             df = main_df
             if self.start_time is not None:
@@ -183,30 +153,30 @@ class SimpleModelTrainer:
             # ============================================================
             print(f"\n📊 Step 3/4: Pre-processing levels for {len(df)} candles...")
             preprocess_start = datetime.now()
-            
+
             all_levels = []
             for i in range(len(df)):
                 current_price = df.close.iloc[i]
                 levels_raw = self.autonomous_trader.level_extractor.deserialize_levels_json(df['levels_json'].iloc[i])
                 levels = self.autonomous_trader.level_extractor.convert_raw_to_levelinfo(levels_raw, float(current_price))
                 all_levels.append(levels)
-            
+
             preprocess_time = (datetime.now() - preprocess_start).total_seconds()
             print(f"   ✅ Levels pre-processed in {preprocess_time:.2f}s")
 
             # ============================================================
             # STEP 2: CALCULATE TA FEATURES ONCE FOR ENTIRE DATAFRAME
             # ============================================================
-            print(f"\n� Step 2/4: Calculating TA features for entire dataset...")
+            print("\n Step 2/4: Calculating TA features for entire dataset...")
             ta_start = datetime.now()
-            
+
             # Calculate TA features once for the full DataFrame
             ta_features_df = self.autonomous_trader._calculate_ta_features(
                 data=df,
                 timeframe=timeframe,
                 use_log_scale=True
             )
-            
+
             ta_time = (datetime.now() - ta_start).total_seconds()
             print(f"   ✅ TA features calculated in {ta_time:.2f}s ({len(ta_features_df.columns)} features)")
 
@@ -215,28 +185,28 @@ class SimpleModelTrainer:
             # ============================================================
             print("\n🎯 Step 3/4: Calculating level features per candle...")
             level_start = datetime.now()
-            
+
             from extraction.feature_engineer import LevelBasedFeatureEngineer
             level_engineer = LevelBasedFeatureEngineer()
-            
+
             all_level_features = []
             for i in tqdm(range(len(df)), desc="Level features"):
                 current_price = df.close.iloc[i]
                 current_volume = df.volume.iloc[i]
                 levels = all_levels[i]  # Pre-processed levels (no JSON parsing!)
-                
+
                 # Calculate level features for SINGLE candle (fast!)
                 level_features_dict = level_engineer.create_level_features(
                     current_price=float(current_price),
                     current_volume=float(current_volume),
                     levels=levels
                 )
-                
+
                 all_level_features.append(level_features_dict)
-            
+
             # Convert list of dicts to DataFrame
             level_features_df = pd.DataFrame(all_level_features, index=df.index)
-            
+
             level_time = (datetime.now() - level_start).total_seconds()
             print(f"   ✅ Level features calculated in {level_time:.2f}s ({len(level_features_df.columns)} features)")
 
@@ -245,22 +215,22 @@ class SimpleModelTrainer:
             # ============================================================
             print(f"\n💾 Step 4/4: Adding memory features...")
             memory_start = datetime.now()
-            
+
             # Create 10 memory feature columns filled with zeros
             # (Memory features are for live trading alignment, not used in training)
             memory_feature_names = [
-                'recent_trades', 'recent_wins', 'recent_losses', 
+                'recent_trades', 'recent_wins', 'recent_losses',
                 'avg_win_pct', 'avg_loss_pct', 'win_rate',
                 'avg_holding_periods', 'total_profit_loss',
                 'consecutive_wins', 'consecutive_losses'
             ]
-            
+
             memory_features_df = pd.DataFrame(
-                0.0, 
-                index=df.index, 
+                0.0,
+                index=df.index,
                 columns=memory_feature_names
             )
-            
+
             memory_time = (datetime.now() - memory_start).total_seconds()
             print(f"   ✅ Memory features added in {memory_time:.3f}s ({len(memory_features_df.columns)} features)")
 
@@ -269,13 +239,13 @@ class SimpleModelTrainer:
             # ============================================================
             print(f"\n🔗 Combining all feature groups...")
             combine_start = datetime.now()
-            
+
             features_df = pd.concat([
                 ta_features_df,
                 level_features_df,
                 memory_features_df
             ], axis=1)
-            
+
             combine_time = (datetime.now() - combine_start).total_seconds()
             print(f"   ✅ Features combined in {combine_time:.3f}s")
 
@@ -475,19 +445,14 @@ class SimpleModelTrainer:
         # Check all level timeframe files
         print(f"\n📊 Validating level timeframes: {level_timeframes}")
         missing_files = []
-        level_files = {}
 
         for tf in level_timeframes:
             if tf not in training_files:
                 missing_files.append(f"{tf} (not in training_files dict)")
                 continue
 
-            file_path = training_files[tf]
-            if not os.path.exists(file_path):
-                missing_files.append(f"{tf} (file not found: {file_path})")
-            else:
-                level_files[tf] = file_path
-                print(f"   ✅ {tf}: {file_path}")
+            if not os.path.exists(training_files[tf]):
+                missing_files.append(f"{tf} (file not found: {training_files[tf]})")
 
         # Report any missing files (after checking ALL timeframes)
         if missing_files:
@@ -496,15 +461,15 @@ class SimpleModelTrainer:
                 print(f"   • {missing}")
             raise FileNotFoundError(f"Missing {len(missing_files)} required level timeframe file(s)")
 
-        print(f"\n✅ All {len(level_files)} level timeframe files validated!")
-        print(f"   Level timeframes: {list(level_files.keys())}")
+        print(f"\n✅ All {len(training_files)} level timeframe files validated!")
+        print(f"   Level timeframes: {list(training_files.keys())}")
 
         print("\n📦 Loading precomputed features from parquet...")
         main_df = self.autonomous_trader.level_extractor.load_precomputed_levels(parquet_path)
         print(f"   ✅ Loaded {len(main_df):,} candles from precomputed parquet")
 
         print("\n📂 Loading level timeframe data...")
-        data_dfs = self._load_dataframes_from_files(level_files)
+        data_dfs = self._load_dataframes_from_files(training_files)
 
         # Prepare data
         features_df, labels = self._prepare_training_data(main_df, data_dfs, timeframe=time_frame_to_train)

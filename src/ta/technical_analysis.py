@@ -15,8 +15,8 @@ from typing import TypedDict
 
 
 # Type definitions for analysis results
-# Pivot: (timestamp, price, type)
-Pivot = Tuple[pd.Timestamp, float, Optional[Literal['high', 'low']]]
+# Pivot: (timestamp, price, volume, type)
+Pivot = Tuple[pd.Timestamp, float, float, Optional[Literal['HH', 'HL', 'LL', 'LH']]]  # High/Low with swing type
 
 
 LineType = Literal['zigzag',
@@ -94,13 +94,22 @@ class TechnicalAnalysisProcessor:
         Returns:
             AnalysisDict: Dictionary containing results from all middlewares.
         """
+        import time
         analysis: AnalysisDict = {}
         for middleware in self.middlewares:
             try:
+                # ⏱️ PROFILING: Time each middleware
+                start = time.time()
                 result = middleware(self.time_frame, self.df, self.last_pivot, analysis, self.useLogScale)
+                elapsed = time.time() - start
+
                 # Each middleware should return {middleware_name: {lines: [], pivots: [], vp: []}}
                 for key, value in result.items():
                     analysis[key] = value
+
+                # Show timing if significant (> 10ms)
+                if elapsed > 0.01:
+                    print(f"      🔧 {middleware.__name__}: {elapsed:.3f}s")
             except Exception as e:
                 # Log error but continue with next middleware
                 print(f"Error occurred while processing middleware {middleware.__name__}: {e}")

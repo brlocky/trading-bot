@@ -7,8 +7,11 @@ vectorized backtesting for high-performance strategy evaluation.
 
 import pandas as pd
 import vectorbt as vbt
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, cast
 from pathlib import Path
+
+from core.trading_types import ChartInterval
+from ta.technical_analysis import Pivot
 
 
 class VectorBTBacktester:
@@ -55,7 +58,9 @@ class VectorBTBacktester:
         # No more FeatureManager! Use trainer's AutonomousTrader instead
         # All feature calculation happens in AutonomousTrader (single source of truth)
 
-    def _load_levels_from_df(self, data_dfs: Dict[str, pd.DataFrame], max_date=None) -> Dict:
+    def _load_levels_from_df(self, data_dfs: Dict[ChartInterval, pd.DataFrame],
+                             last_pivot: Pivot, live_timeframe: ChartInterval,
+                             use_log_scale: bool) -> Dict:
         """
         Load levels from DataFrames using trainer's AutonomousTrader configured extractor.
         Uses the level_extraction_config from trainer's AutonomousTrader initialization.
@@ -69,56 +74,69 @@ class VectorBTBacktester:
         try:
             all_levels = self.trainer.autonomous_trader.level_extractor.extract_levels_from_dataframes(
                 data_dfs,
-                max_date=max_date
+                last_pivot=last_pivot,
+                live_timeframe=live_timeframe,
+                use_log_scale=use_log_scale
             )
-            for tf, levels in all_levels.items():
-                print(f"   ✅ Loaded {len(levels)} levels from {tf}")
             return all_levels
         except Exception as e:
             print(f"   ⚠️  Error loading levels: {e}")
             # Return empty dict for each timeframe
             return {tf: [] for tf in data_dfs.keys()}
 
-    def generate_signals(
+    def generate_signals_from_parquet(
         self,
-        data: pd.DataFrame,
-        data_dfs: Dict[str, pd.DataFrame],
+        parquet_path: str,
         buy_threshold: float = 0.10,
         sell_threshold: float = 0.10,
-        timeframe: str = '15m',
+        timeframe: ChartInterval = '15m',
+        start_time: Optional[pd.Timestamp] = None,
+        end_time: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
         """
-        Generate trading signals PROGRESSIVELY - one candle at a time.
+        ULTRA-FAST signal generation from precomputed parquet file.
 
-        For EACH candle:
-        1. Extract levels from all timeframes (only data up to current candle timestamp)
-        2. Calculate features for that candle
-        3. Make prediction
-        4. Move to next candle
-
-        This simulates REAL TRADING with no data leakage.
+        This is the fastest method as it reuses the exact same logic from
+        SimpleModelTrainer._prepare_training_data but for prediction instead of training.
 
         Args:
-            data: DataFrame with OHLCV data (must have datetime index)
-            data_dfs: Dict of timeframe -> DataFrame with levels
+            parquet_path: Path to parquet file with precomputed levels
             buy_threshold: Minimum probability for BUY signal
             sell_threshold: Minimum probability for SELL signal
-            timeframe: Timeframe for feature calculation (e.g., '15m', '1h', 'D')
+            timeframe: Timeframe for feature calculation
+            start_time: Optional start time filter
+            end_time: Optional end time filter
 
         Returns:
-            DataFrame with columns: datetime, close, buy_prob, sell_prob, hold_prob,
-                                   signal, confidence, entries, exits
+            DataFrame with signals and probabilities
         """
+        from datetime import datetime
+        from tqdm import tqdm
+        import numpy as np
+
         if not self.trainer.is_trained:
             raise ValueError("Model is not trained. Train the model first.")
 
-        print(f"🎯 PROGRESSIVE BACKTESTING: Processing {len(data)} candles...")
-        print("⚠️  This will take longer as we extract levels for EACH candle")
-        print("   (simulates real trading - no data leakage!)\n")
+        print("🚀 ULTRA-FAST BACKTESTING: Using precomputed parquet file...")
+        print("   Maximum speed with bulk processing!\n")
+        start_time_calc = datetime.now()
 
-        # Ensure datetime is in index
-        if 'datetime' in data.columns and not isinstance(data.index, pd.DatetimeIndex):
-            data = data.set_index('datetime')
+        # Load precomputed data from parquet
+        print("📦 Loading precomputed features from parquet...")
+        data = self.trainer.autonomous_trader.level_extractor.load_precomputed_levels(parquet_path)
+        print(f"   ✅ Loaded {len(data):,} candles from parquet")
+
+        # Apply time filtering if specified
+        if start_time is not None:
+            data = data[data.index >= start_time]
+            print(f"   ⏰ Filtered from start_time: {len(data):,} candles remaining")
+
+        if end_time is not None:
+            data = data[data.index <= end_time]
+            print(f"   ⏰ Filtered to end_time: {len(data):,} candles remaining")
+
+        if len(data) == 0:
+            raise ValueError("No data remaining after time filtering!")
 
         # Get model components
         model_data = self.trainer.model_data
@@ -126,59 +144,136 @@ class VectorBTBacktester:
         label_encoder = model_data['label_encoder']
         feature_columns = model_data['feature_columns']
 
-        # Prepare results storage
-        results = []
+        # ============================================================
+        # REUSE EXACT LOGIC FROM TRAINER._PREPARE_TRAINING_DATA
+        # ============================================================
 
-        # Process each candle progressively
-        from tqdm import tqdm
-        for i in tqdm(range(len(data)), desc="Processing candles"):
-            current_timestamp = data.index[i]
+        # STEP 1: Calculate TA features for full dataset
+        print("📈 Step 1/4: Calculating TA features for full dataset...")
+        ta_start = datetime.now()
 
-            # Get data UP TO current candle (including current)
-            historical_data = data.iloc[:i+1]
+        ta_features_df = self.trainer.autonomous_trader._calculate_ta_features(
+            data=data,
+            timeframe=timeframe,
+            use_log_scale=True
+        )
 
-            # Extract levels from all timeframes - ONLY data up to current_timestamp
-            levels = self._load_levels_from_df(data_dfs, max_date=current_timestamp)
+        ta_time = (datetime.now() - ta_start).total_seconds()
+        print(f"   ✅ TA features calculated in {ta_time:.2f}s ({len(ta_features_df.columns)} features)")
 
-            # Calculate features for current candle using historical data
-            all_features = self.trainer.autonomous_trader.get_all_features(
-                data=historical_data,
-                levels=levels,
-                timeframe=timeframe,
-                use_log_scale=True,
-                current_date=current_timestamp
+        # STEP 2: Pre-process levels for all candles (optimized)
+        print(f"📊 Step 2/4: Pre-processing levels for {len(data)} candles...")
+        preprocess_start = datetime.now()
+
+        all_levels = []
+        for i in range(len(data)):
+            current_price = data.close.iloc[i]
+            levels_raw = self.trainer.autonomous_trader.level_extractor.deserialize_levels_json(data['levels_json'].iloc[i])
+            levels = self.trainer.autonomous_trader.level_extractor.convert_raw_to_levelinfo(levels_raw, float(current_price))
+            all_levels.append(levels)
+
+        preprocess_time = (datetime.now() - preprocess_start).total_seconds()
+        print(f"   ✅ Levels pre-processed in {preprocess_time:.2f}s")
+
+        # STEP 3: Calculate level features per candle (bulk optimized)
+        print("🎯 Step 3/4: Calculating level features per candle...")
+        level_start = datetime.now()
+
+        from extraction.feature_engineer import LevelBasedFeatureEngineer
+        level_engineer = LevelBasedFeatureEngineer()
+
+        all_level_features = []
+        for i in tqdm(range(len(data)), desc="Level features"):
+            current_price = data.close.iloc[i]
+            current_volume = data.volume.iloc[i]
+            levels = all_levels[i]  # Pre-processed levels (no JSON parsing per iteration!)
+
+            # Calculate level features for SINGLE candle (fast!)
+            level_features_dict = level_engineer.create_level_features(
+                current_price=float(current_price),
+                current_volume=float(current_volume),
+                levels=levels
             )
+            all_level_features.append(level_features_dict)
 
-            # Get features for the current candle (last row)
-            current_features = all_features.iloc[-1:]
+        # Convert list of dicts to DataFrame
+        level_features_df = pd.DataFrame(all_level_features, index=data.index)
 
-            # Ensure exact feature match with training features
-            for col in feature_columns:
-                if col not in current_features.columns:
-                    current_features[col] = 0.0
+        level_time = (datetime.now() - level_start).total_seconds()
+        print(f"   ✅ Level features calculated in {level_time:.2f}s ({len(level_features_df.columns)} features)")
 
-            # Align features with training order
-            features_aligned = current_features[feature_columns]
+        # STEP 4: Add memory features (zeros for backtesting alignment)
+        print("💾 Step 4/4: Adding memory features...")
+        memory_start = datetime.now()
 
-            # Generate prediction for this candle
-            probabilities = trained_model.predict_proba(features_aligned)[0]
+        memory_feature_names = [
+            'recent_trades', 'recent_wins', 'recent_losses',
+            'avg_win_pct', 'avg_loss_pct', 'win_rate',
+            'avg_holding_periods', 'total_profit_loss',
+            'consecutive_wins', 'consecutive_losses'
+        ]
 
-            # Store results
-            result = {
-                'timestamp': current_timestamp,
-                'close': data.iloc[i]['close']
-            }
+        memory_features_df = pd.DataFrame(
+            0.0,
+            index=data.index,
+            columns=memory_feature_names
+        )
 
-            # Add probabilities for each class
-            classes = label_encoder.classes_
-            for j, class_name in enumerate(classes):
-                result[f'{class_name}_prob'] = probabilities[j]
+        memory_time = (datetime.now() - memory_start).total_seconds()
+        print(f"   ✅ Memory features added in {memory_time:.3f}s ({len(memory_features_df.columns)} features)")
 
-            results.append(result)
+        # ============================================================
+        # COMBINE ALL FEATURES (SAME AS TRAINING)
+        # ============================================================
+        print("🔗 Combining all feature groups...")
+        combine_start = datetime.now()
 
-        # Convert to DataFrame
-        signals_df = pd.DataFrame(results)
-        signals_df = signals_df.set_index('timestamp')
+        features_df = pd.concat([
+            ta_features_df,
+            level_features_df,
+            memory_features_df
+        ], axis=1)
+
+        combine_time = (datetime.now() - combine_start).total_seconds()
+        print(f"   ✅ Features combined in {combine_time:.3f}s")
+
+        print(f"✅ Features ready: {len(features_df)} samples, {len(features_df.columns)} features")
+        print(f"   TA: {len(ta_features_df.columns)}, Level: {len(level_features_df.columns)}, Memory: {len(memory_features_df.columns)}")
+
+        # Ensure exact feature match with training features
+        for col in feature_columns:
+            if col not in features_df.columns:
+                features_df[col] = 0.0
+
+        # Align features with training order
+        features_aligned = features_df[feature_columns]
+
+        # Clean NaN and infinite values
+        features_aligned = features_aligned.fillna(0.0)
+        features_aligned = features_aligned.replace([np.inf, -np.inf], 0.0)
+
+        # ============================================================
+        # BULK PREDICTION (VECTORIZED)
+        # ============================================================
+        print(f"🔮 Generating predictions for {len(features_aligned)} candles...")
+        pred_start = datetime.now()
+
+        # Generate predictions for ALL candles at once (vectorized)
+        probabilities = trained_model.predict_proba(features_aligned)
+
+        pred_time = (datetime.now() - pred_start).total_seconds()
+        print(f"   ✅ Predictions generated in {pred_time:.2f}s")
+
+        # ============================================================
+        # CREATE SIGNALS DATAFRAME
+        # ============================================================
+        signals_df = pd.DataFrame(index=data.index)
+        signals_df['close'] = data['close']
+
+        # Add probabilities for each class
+        classes = label_encoder.classes_
+        for j, class_name in enumerate(classes):
+            signals_df[f'{class_name}_prob'] = probabilities[:, j]
 
         # Determine signals based on thresholds
         buy_prob = signals_df.get('buy_prob', pd.Series(0.0, index=signals_df.index))
@@ -198,14 +293,301 @@ class VectorBTBacktester:
         signals_df.loc[sell_mask, 'confidence'] = sell_prob[sell_mask]
 
         # Create entry/exit signals for VectorBT
-        signals_df['entries'] = (signals_df['signal'] == 'BUY').astype(int)
-        signals_df['exits'] = (signals_df['signal'] == 'SELL').astype(int)
+        buy_signals = (signals_df['signal'] == 'BUY').sum()
+        sell_signals = (signals_df['signal'] == 'SELL').sum()
 
-        print("\n✅ PROGRESSIVE BACKTESTING COMPLETE")
-        print(f"   Processed: {len(signals_df)} candles")
+        print("\n🔍 Signal Analysis:")
+        print(f"   BUY signals: {buy_signals}")
+        print(f"   SELL signals: {sell_signals}")
+
+        if buy_signals == 0 and sell_signals > 0:
+            print("⚠️  No BUY signals detected - adjusting strategy...")
+            buy_threshold_auto = buy_prob.quantile(0.9)  # Top 10% of BUY probabilities
+            print(f"   Auto-adjusted BUY threshold: {buy_threshold_auto:.4f}")
+
+            signals_df['entries'] = (buy_prob >= buy_threshold_auto).astype(int)
+            signals_df['exits'] = (signals_df['signal'] == 'SELL').astype(int)
+            signals_df.loc[buy_prob >= buy_threshold_auto, 'signal'] = 'BUY'
+
+            new_buy_signals = signals_df['entries'].sum()
+            new_sell_signals = signals_df['exits'].sum()
+            print(f"   Adjusted BUY signals: {new_buy_signals}")
+            print(f"   Adjusted SELL signals: {new_sell_signals}")
+        else:
+            signals_df['entries'] = (signals_df['signal'] == 'BUY').astype(int)
+            signals_df['exits'] = (signals_df['signal'] == 'SELL').astype(int)
+
+        # Calculate and display total time taken
+        total_time = (datetime.now() - start_time_calc).total_seconds()
+        print("\n" + "=" * 70)
+        print("✅ ULTRA-FAST BACKTESTING COMPLETE")
+        print("=" * 70)
+        print(f"⏱️  Total time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+        print(f"📊 Processed: {len(signals_df):,} candles")
         print(f"   BUY: {(signals_df['signal'] == 'BUY').sum()}")
         print(f"   SELL: {(signals_df['signal'] == 'SELL').sum()}")
         print(f"   HOLD: {(signals_df['signal'] == 'HOLD').sum()}")
+        print(f"⚡ Average time per candle: {total_time/len(signals_df)*1000:.2f} milliseconds")
+        print("=" * 70 + "\n")
+
+        self.signals_df = signals_df
+        return signals_df
+
+    def generate_signals(
+        self,
+        data: pd.DataFrame,
+        data_dfs: Dict[ChartInterval, pd.DataFrame],
+        buy_threshold: float = 0.10,
+        sell_threshold: float = 0.10,
+        timeframe: ChartInterval = '15m',
+    ) -> pd.DataFrame:
+        """
+        Generate trading signals with optional optimized bulk processing.
+
+        Args:
+            data: DataFrame with OHLCV data(must have datetime index)
+            data_dfs: Dict of timeframe -> DataFrame with levels
+            buy_threshold: Minimum probability for BUY signal
+            sell_threshold: Minimum probability for SELL signal
+            timeframe: Timeframe for feature calculation(e.g., '15m', '1h', 'D')
+            use_optimized: If True, uses optimized bulk processing (recommended)
+                          If False, uses progressive candle-by-candle (slower but transparent)
+
+        Returns:
+            DataFrame with columns: datetime, close, buy_prob, sell_prob, hold_prob,
+                                   signal, confidence, entries, exits
+        """
+        if not self.trainer.is_trained:
+            raise ValueError("Model is not trained. Train the model first.")
+
+        return self._generate_signals_optimized(data, data_dfs, buy_threshold, sell_threshold, timeframe)
+
+    def _generate_signals_optimized(
+        self,
+        data: pd.DataFrame,
+        data_dfs: Dict[ChartInterval, pd.DataFrame],
+        buy_threshold: float,
+        sell_threshold: float,
+        timeframe: ChartInterval,
+    ) -> pd.DataFrame:
+        """
+        OPTIMIZED signal generation using bulk processing (based on trainer's _prepare_training_data).
+
+        This method reuses the efficient bulk processing approach from SimpleModelTrainer
+        for much faster backtesting. While we still need to extract levels per candle
+        to prevent data leakage, we optimize by:
+        1. Bulk TA feature calculation for entire dataset
+        2. Bulk level feature processing (after level extraction)
+        3. Vectorized predictions for all candles at once
+
+        Key difference from training: No parquet file, so levels must be extracted
+        from live timeframe data while preventing data leakage.
+        """
+        from datetime import datetime
+        from tqdm import tqdm
+        import numpy as np
+
+        print(f"🚀 OPTIMIZED BACKTESTING: Processing {len(data)} candles...")
+        print("   Using bulk processing for maximum speed!\n")
+        start_time = datetime.now()
+
+        # Get model components
+        model_data = self.trainer.model_data
+        trained_model = model_data['model']
+        label_encoder = model_data['label_encoder']
+        feature_columns = model_data['feature_columns']
+
+        # ============================================================
+        # STEP 1: CALCULATE TA FEATURES FOR FULL DATASET (OPTIMIZED)
+        # ============================================================
+        print("📈 Step 1/3: Calculating TA features for full dataset...")
+        ta_start = datetime.now()
+
+        # Calculate TA features once for the FULL DataFrame (optimized approach)
+        ta_features_df = self.trainer.autonomous_trader._calculate_ta_features(
+            data=data,
+            timeframe=timeframe,
+            use_log_scale=True
+        )
+
+        ta_time = (datetime.now() - ta_start).total_seconds()
+        print(f"   ✅ TA features calculated in {ta_time:.2f}s ({len(ta_features_df.columns)} features)")
+
+        # ============================================================
+        # STEP 2: EXTRACT LEVELS FOR ALL CANDLES (WITH DATA LEAKAGE PREVENTION)
+        # ============================================================
+        print(f"📊 Step 2/3: Extracting levels for {len(data)} candles...")
+        preprocess_start = datetime.now()
+
+        # Extract levels from timeframe data for each candle
+        # We must do this per candle to prevent data leakage in backtesting
+        all_levels = []
+        for i in tqdm(range(len(data)), desc="Extracting levels"):
+            current_timestamp = cast(pd.Timestamp, data.index[i])
+            current_price = data.close[i]
+
+            # CRITICAL: Get only data up to current timestamp to prevent data leakage
+            filtered_data_dfs = {}
+            for tf, df in data_dfs.items():
+                filtered_data_dfs[tf] = df[df.index <= current_timestamp]
+
+            raw_levels = self._load_levels_from_df(
+                filtered_data_dfs,
+                last_pivot=(current_timestamp, current_price, None, None),
+                live_timeframe=timeframe,
+                use_log_scale=True
+            )
+            levels = self.trainer.autonomous_trader.level_extractor.convert_raw_to_levelinfo(
+                raw_levels, current_price
+            )
+            all_levels.append(levels)
+
+        preprocess_time = (datetime.now() - preprocess_start).total_seconds()
+        print(f"   ✅ Levels extracted in {preprocess_time:.2f}s")
+
+        # ============================================================
+        # STEP 3: CALCULATE LEVEL FEATURES (BULK OPTIMIZED)
+        # ============================================================
+        print("🎯 Step 3/3: Calculating level features per candle...")
+        level_start = datetime.now()
+
+        from extraction.feature_engineer import LevelBasedFeatureEngineer
+        level_engineer = LevelBasedFeatureEngineer()
+
+        all_level_features = []
+        for i in tqdm(range(len(data)), desc="Level features"):
+            current_price = data.close.iloc[i]
+            current_volume = data.volume.iloc[i]
+            levels = all_levels[i]  # Pre-processed levels (no JSON parsing!)
+
+            # Calculate level features for SINGLE candle (fast!)
+            level_features_dict = level_engineer.create_level_features(
+                current_price=float(current_price),
+                current_volume=float(current_volume),
+                levels=levels
+            )
+            all_level_features.append(level_features_dict)
+
+        # Convert list of dicts to DataFrame
+        level_features_df = pd.DataFrame(all_level_features, index=data.index)
+
+        level_time = (datetime.now() - level_start).total_seconds()
+        print(f"   ✅ Level features calculated in {level_time:.2f}s ({len(level_features_df.columns)} features)")
+
+        # ============================================================
+        # STEP 4: ADD MEMORY FEATURES (ZEROS FOR BACKTESTING)
+        # ============================================================
+        memory_feature_names = [
+            'recent_trades', 'recent_wins', 'recent_losses',
+            'avg_win_pct', 'avg_loss_pct', 'win_rate',
+            'avg_holding_periods', 'total_profit_loss',
+            'consecutive_wins', 'consecutive_losses'
+        ]
+
+        memory_features_df = pd.DataFrame(
+            0.0,
+            index=data.index,
+            columns=memory_feature_names
+        )
+
+        # ============================================================
+        # STEP 5: COMBINE ALL FEATURES
+        # ============================================================
+        features_df = pd.concat([
+            ta_features_df,
+            level_features_df,
+            memory_features_df
+        ], axis=1)
+
+        # Ensure exact feature match with training features
+        for col in feature_columns:
+            if col not in features_df.columns:
+                features_df[col] = 0.0
+
+        # Align features with training order
+        features_aligned = features_df[feature_columns]
+
+        # Clean NaN and infinite values
+        features_aligned = features_aligned.fillna(0.0)
+        features_aligned = features_aligned.replace([np.inf, -np.inf], 0.0)
+
+        # ============================================================
+        # STEP 6: BULK PREDICTION (VECTORIZED)
+        # ============================================================
+        print(f"🔮 Generating predictions for {len(features_aligned)} candles...")
+        pred_start = datetime.now()
+
+        # Generate predictions for ALL candles at once (vectorized)
+        probabilities = trained_model.predict_proba(features_aligned)
+
+        pred_time = (datetime.now() - pred_start).total_seconds()
+        print(f"   ✅ Predictions generated in {pred_time:.2f}s")
+
+        # ============================================================
+        # STEP 7: CREATE SIGNALS DATAFRAME
+        # ============================================================
+        signals_df = pd.DataFrame(index=data.index)
+        signals_df['close'] = data['close']
+
+        # Add probabilities for each class
+        classes = label_encoder.classes_
+        for j, class_name in enumerate(classes):
+            signals_df[f'{class_name}_prob'] = probabilities[:, j]
+
+        # Determine signals based on thresholds
+        buy_prob = signals_df.get('buy_prob', pd.Series(0.0, index=signals_df.index))
+        sell_prob = signals_df.get('sell_prob', pd.Series(0.0, index=signals_df.index))
+        hold_prob = signals_df.get('hold_prob', pd.Series(0.0, index=signals_df.index))
+
+        # Apply thresholds
+        signals_df['signal'] = 'HOLD'
+        signals_df['confidence'] = hold_prob
+
+        buy_mask = (buy_prob > buy_threshold) & (buy_prob > sell_prob)
+        signals_df.loc[buy_mask, 'signal'] = 'BUY'
+        signals_df.loc[buy_mask, 'confidence'] = buy_prob[buy_mask]
+
+        sell_mask = (sell_prob > sell_threshold) & (sell_prob > buy_prob)
+        signals_df.loc[sell_mask, 'signal'] = 'SELL'
+        signals_df.loc[sell_mask, 'confidence'] = sell_prob[sell_mask]
+
+        # Create entry/exit signals for VectorBT
+        buy_signals = (signals_df['signal'] == 'BUY').sum()
+        sell_signals = (signals_df['signal'] == 'SELL').sum()
+
+        print("\n🔍 Signal Analysis:")
+        print(f"   BUY signals: {buy_signals}")
+        print(f"   SELL signals: {sell_signals}")
+
+        if buy_signals == 0 and sell_signals > 0:
+            print("⚠️  No BUY signals detected - adjusting strategy...")
+            buy_threshold_auto = buy_prob.quantile(0.9)  # Top 10% of BUY probabilities
+            print(f"   Auto-adjusted BUY threshold: {buy_threshold_auto:.4f}")
+
+            signals_df['entries'] = (buy_prob >= buy_threshold_auto).astype(int)
+            signals_df['exits'] = (signals_df['signal'] == 'SELL').astype(int)
+            signals_df.loc[buy_prob >= buy_threshold_auto, 'signal'] = 'BUY'
+
+            new_buy_signals = signals_df['entries'].sum()
+            new_sell_signals = signals_df['exits'].sum()
+            print(f"   Adjusted BUY signals: {new_buy_signals}")
+            print(f"   Adjusted SELL signals: {new_sell_signals}")
+        else:
+            signals_df['entries'] = (signals_df['signal'] == 'BUY').astype(int)
+            signals_df['exits'] = (signals_df['signal'] == 'SELL').astype(int)
+
+        # Calculate and display total time taken
+        total_time = (datetime.now() - start_time).total_seconds()
+        print("\n" + "=" * 70)
+        print("✅ OPTIMIZED BACKTESTING COMPLETE")
+        print("=" * 70)
+        print(f"⏱️  Total time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+        print(f"📊 Processed: {len(signals_df):,} candles")
+        print(f"   BUY: {(signals_df['signal'] == 'BUY').sum()}")
+        print(f"   SELL: {(signals_df['signal'] == 'SELL').sum()}")
+        print(f"   HOLD: {(signals_df['signal'] == 'HOLD').sum()}")
+        print(f"⚡ Average time per candle: {total_time/len(signals_df)*1000:.2f} milliseconds")
+        print("=" * 70 + "\n")
 
         self.signals_df = signals_df
         return signals_df
@@ -219,8 +601,8 @@ class VectorBTBacktester:
         Run VectorBT backtest on generated signals.
 
         Args:
-            signals_df: DataFrame with entries/exits (uses self.signals_df if None)
-            freq: Frequency string for VectorBT (e.g., '15T', '1H', '1D')
+            signals_df: DataFrame with entries/exits(uses self.signals_df if None)
+            freq: Frequency string for VectorBT(e.g., '15T', '1H', '1D')
 
         Returns:
             VectorBT Portfolio object with results
@@ -314,8 +696,8 @@ class VectorBTBacktester:
         - Trade markers on price chart
 
         Args:
-            use_widgets: If True, uses FigureWidget (requires anywidget).
-                        If False, uses static Figure (no dependencies).
+            use_widgets: If True, uses FigureWidget(requires anywidget).
+                        If False, uses static Figure(no dependencies).
         """
         if self.portfolio is None:
             raise ValueError("No backtest results available. Run run_backtest() first.")

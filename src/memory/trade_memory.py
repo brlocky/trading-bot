@@ -134,26 +134,27 @@ class TradeMemoryManager:
         """Load trade memory from disk"""
         try:
             if os.path.exists(self.memory_file):
-                with open(self.memory_file, 'r') as f:
-                    trade_data = json.load(f)
+                from training.data_loader import DataLoader
+                trade_data = DataLoader.load_trade_memory_json(self.memory_file)
 
-                # Convert back to TradeRecord objects
-                self.trades = []
-                for trade_dict in trade_data:
-                    timestamp = pd.Timestamp(trade_dict['timestamp']) if trade_dict['timestamp'] else pd.Timestamp.now()
-                    trade = TradeRecord(
-                        timestamp=timestamp,
-                        signal_type=trade_dict['signal_type'],
-                        entry_price=trade_dict['entry_price'],
-                        exit_price=trade_dict.get('exit_price'),
-                        pnl_pct=trade_dict.get('pnl_pct'),
-                        duration_hours=trade_dict.get('duration_hours'),
-                        was_bounce=trade_dict.get('was_bounce', False),
-                        bounce_level_price=trade_dict.get('bounce_level_price'),
-                        bounce_level_type=trade_dict.get('bounce_level_type'),
-                        confidence=trade_dict.get('confidence')
-                    )
-                    self.trades.append(trade)
+                if trade_data:
+                    # Convert back to TradeRecord objects
+                    self.trades = []
+                    for trade_dict in trade_data:
+                        timestamp = pd.Timestamp(trade_dict['timestamp']) if trade_dict['timestamp'] else pd.Timestamp.now()
+                        trade = TradeRecord(
+                            timestamp=timestamp,
+                            signal_type=trade_dict['signal_type'],
+                            entry_price=trade_dict['entry_price'],
+                            exit_price=trade_dict.get('exit_price'),
+                            pnl_pct=trade_dict.get('pnl_pct'),
+                            duration_hours=trade_dict.get('duration_hours'),
+                            was_bounce=trade_dict.get('was_bounce', False),
+                            bounce_level_price=trade_dict.get('bounce_level_price'),
+                            bounce_level_type=trade_dict.get('bounce_level_type'),
+                            confidence=trade_dict.get('confidence')
+                        )
+                        self.trades.append(trade)
 
                 print(f"📚 Loaded {len(self.trades)} trades from memory")
 

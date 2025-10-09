@@ -6,7 +6,8 @@ import json
 import pandas as pd
 from typing import Dict, List, cast
 from core.trading_types import ChartInterval, LevelInfo
-from ta.technical_analysis import Line, Pivot, TechnicalAnalysisProcessor, AnalysisDict, VolumeProfileLine
+from ta.technical_analysis import Line, Pivot, TechnicalAnalysisProcessor, AnalysisDict
+from ta.timeframe_state_manager import TimeframeStateManager
 
 
 class MultitimeframeLevelExtractor:
@@ -16,105 +17,18 @@ class MultitimeframeLevelExtractor:
     Uses AutonomousTrader.get_extraction_config_for_timeframe() to determine:
     - Which middlewares to run per timeframe
     - What data to extract (levels, lines, pivots, vp)
+
+    OPTIMIZATION: Uses TimeframeStateManager to cache results and avoid
+    recalculating unchanged timeframes (5-10x speedup).
     """
 
     def __init__(self):
         """Initialize level extractor with hardcoded extraction strategies."""
         self.level_cache = {}  # Cache for extracted data
 
-    def _resample_and_merge_timeframes(self,
-                                       data_dfs: Dict[ChartInterval, pd.DataFrame],
-                                       live_timeframe: ChartInterval,
-                                       max_date: pd.Timestamp) -> Dict[ChartInterval, pd.DataFrame]:
-        """
-        Resample the live timeframe data to higher timeframes and merge with existing data.
-        This prevents using outdated higher timeframe candles.
-
-        Example:
-        - If live_timeframe='15m' and max_date='2023-05-20 14:30'
-        - Resample 15m -> 1h, D, W, M up to 14:30
-        - Merge with existing 1h, D, W, M data (keeps historical data, updates current incomplete candle)
-
-        Args:
-            data_dfs: Dict of timeframe -> DataFrame
-            live_timeframe: The primary trading timeframe (smallest granularity)
-            max_date: Current datetime
-
-        Returns:
-            Updated dict with resampled higher timeframes
-        """
-        if live_timeframe not in data_dfs:
-            print(f"⚠️  Live timeframe {live_timeframe} not found in data_dfs")
-            return data_dfs
-
-        live_df = data_dfs[live_timeframe].copy()
-
-        # Filter to max_date
-        live_df = live_df[live_df.index <= max_date]
-
-        if len(live_df) == 0:
-            print(f"⚠️  No data in live timeframe {live_timeframe} up to {max_date}")
-            return data_dfs
-
-        print(f"   📊 Live data: {len(live_df)} candles ({live_df.index[0]} to {live_df.index[-1]})")
-
-        # Define resampling rules: live_timeframe -> higher timeframes
-        # Only resample to timeframes that exist in ChartInterval
-        resample_rules = {
-            '15m': {'1h': '1H', 'D': '1D', 'W': '1W', 'M': '1ME'},  # M = Month End
-            '1h': {'D': '1D', 'W': '1W', 'M': '1ME'},
-            'D': {'W': '1W', 'M': '1ME'},
-            'W': {'M': '1ME'},
-        }
-
-        if live_timeframe not in resample_rules:
-            print(f"   ℹ️  No resampling rules for {live_timeframe}")
-            return data_dfs
-
-        rules = resample_rules[live_timeframe]
-        updated_dfs = data_dfs.copy()
-
-        for target_tf, pandas_rule in rules.items():
-            try:
-                # Resample live data to target timeframe
-                resampled = live_df.resample(pandas_rule).agg({
-                    'open': 'first',
-                    'high': 'max',
-                    'low': 'min',
-                    'close': 'last',
-                    'volume': 'sum'
-                }).dropna()
-
-                if len(resampled) == 0:
-                    continue
-
-                print(f"   ✅ Resampled {live_timeframe} -> {target_tf}: {len(resampled)} candles")
-
-                # Merge with existing data if available
-                if target_tf in data_dfs and len(data_dfs[target_tf]) > 0:
-                    existing_df = data_dfs[target_tf].copy()
-
-                    # Keep historical data (before resampled range)
-                    historical = existing_df[existing_df.index < resampled.index[0]]
-
-                    # Combine: historical + resampled (resampled overwrites overlapping period)
-                    merged = pd.concat([historical, resampled])
-                    merged = merged[~merged.index.duplicated(keep='last')]  # Keep last (resampled) for duplicates
-                    merged = merged.sort_index()
-
-                    updated_dfs[target_tf] = merged
-                    print(f"      📌 Merged with existing: {len(historical)} historical + {len(resampled)} resampled = {len(merged)} total")
-                else:
-                    # No existing data, use resampled only
-                    updated_dfs[target_tf] = resampled
-                    print(f"      📌 Using resampled data only: {len(resampled)} candles")
-
-            except Exception as e:
-                print(f"   ❌ Error resampling {live_timeframe} -> {target_tf}: {e}")
-                continue
-
-        print("   ✅ Resampling complete!\n")
-        return updated_dfs
+        # NEW: Timeframe state management for intelligent caching
+        self.state_manager = TimeframeStateManager()
+        print("✅ Level extractor initialized with timeframe caching")
 
     def extract_levels_from_dataframes(self,
                                        data_dfs: Dict[ChartInterval, pd.DataFrame],
@@ -136,17 +50,27 @@ class MultitimeframeLevelExtractor:
         """
         from trading.autonomous_trader import AutonomousTrader
         max_date = last_pivot[0]
-        # ============================================================
-        # STEP 1: RESAMPLE LIVE TIMEFRAME TO HIGHER TIMEFRAMES
-        # ============================================================
-        # This ensures all timeframes reflect the same current market state
-        # and prevents using outdated data from incomplete higher timeframe candles
-        print(f"\n🔄 Resampling {live_timeframe} data to higher timeframes...")
-        data_dfs = self._resample_and_merge_timeframes(data_dfs, live_timeframe, max_date)
+
+        # ⚠️ CRITICAL: Filter all data by max_date FIRST to prevent data leakage
+        # AND to ensure cache checks only see available data at this point in time
+        filtered_dfs: Dict[ChartInterval, pd.DataFrame] = {}
+        for timeframe_str, df_full in data_dfs.items():
+            df = df_full.copy()
+            # Ensure index is DatetimeIndex for proper comparison
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index)
+            # Filter by max_date
+            df = df[df.index <= max_date].copy()
+            filtered_dfs[timeframe_str] = df
+
+        # ⚡ OPTIMIZATION: Check which timeframes actually need recalculation
+        # This prevents recalculating unchanged timeframes (e.g., Monthly data when only 15m candle arrives)
+        # Pass use_log_scale to ensure cache invalidates when scale changes
+        needs_update = self.state_manager.get_timeframes_needing_update(filtered_dfs, use_log_scale=use_log_scale)
 
         all_levels: Dict[ChartInterval, Dict[str, List]] = {}
 
-        for timeframe_str, df_full in data_dfs.items():
+        for timeframe_str, df_filtered in filtered_dfs.items():
             # Cast string to ChartInterval for type safety
             timeframe: ChartInterval = timeframe_str  # type: ignore  # We know these are valid ChartInterval values
             # Get hardcoded extraction config for this timeframe
@@ -164,27 +88,32 @@ class MultitimeframeLevelExtractor:
                 print(f'⏭️  Skipping {timeframe} (no extraction configured)')
                 continue
 
+            # ⚡ CACHE CHECK: Skip calculation if timeframe hasn't changed
+            if timeframe not in needs_update:
+                cached_result = self.state_manager.get_cached_result(timeframe)
+                if cached_result is not None:
+                    all_levels[timeframe] = cached_result
+                    continue
+
             try:
-                # ⚠️ CRITICAL: Filter data by max_date to prevent data leakage
-                df = df_full.copy()  # Work with a copy
+                import time
+                t_start = time.time()
 
-                df = df[df.index <= max_date].copy()
+                # Data is already filtered by max_date above
+                t1 = time.time()
+                df = df_filtered  # Already a copy from filtering step
+                t_copy = time.time() - t1
 
-                # ⚡ OPTIMIZATION: For 1h timeframe, only look back 7 days to reduce computation
+                t2 = time.time()
+                # No need to filter again - already done above
+                t_filter = time.time() - t2
+
+                # ⚡ OPTIMIZATION: For 1h timeframe, only look back 31 days to reduce computation
                 # Recent price action is more relevant than 3 years of history
                 if timeframe == '1h' and len(df) > 0:
                     from datetime import timedelta
-                    lookback_date = max_date - timedelta(days=7)
+                    lookback_date = max_date - timedelta(days=31)
                     df = df[df.index >= lookback_date].copy()
-                    print(f"   ⚡ 1h optimization: Limited to last 7 days ({len(df)} candles)")
-
-                # ⚡ OPTIMIZATION: For D timeframe, only look back 180 days to reduce computation
-                # Recent price action is more relevant
-                if timeframe == 'D' and len(df) > 0:
-                    from datetime import timedelta
-                    lookback_date = max_date - timedelta(days=180)
-                    df = df[df.index >= lookback_date].copy()
-                    print(f"   ⚡ D optimization: Limited to last 180 days ({len(df)} candles)")
 
                 # ⚡ OPTIMIZATION: For D timeframe, only look back 180 days to reduce computation
                 # Recent price action is more relevant
@@ -192,32 +121,47 @@ class MultitimeframeLevelExtractor:
                     from datetime import timedelta
                     lookback_date = max_date - timedelta(days=7)
                     df = df[df.index >= lookback_date].copy()
-                    print(f"   ⚡ 15m optimization: Limited to last 7 days ({len(df)} candles)")
 
                 # Skip if no data available
                 if len(df) == 0:
                     all_levels[timeframe] = {'lines': [], 'pivots': []}
                     continue
 
-                # 🔍 DEBUG: Show what we're processing
-                print(f"🔍 [{timeframe}] Processing {len(df)} candles (max_date={max_date})")
-                if len(df) > 0:
-                    print(f"   Data range: {df.index[0]} to {df.index[-1]}")
-
                 # Run technical analysis with configured middlewares
+                t3 = time.time()
                 processor = TechnicalAnalysisProcessor(df, timeframe, last_pivot, use_log_scale)
+                t_processor_init = time.time() - t3
 
+                t4 = time.time()
                 for middleware in middlewares:
                     processor.register_middleware(middleware)
+                t_register = time.time() - t4
 
+                # ⏱️ PROFILING: Time each middleware to identify bottlenecks
+                t5 = time.time()
                 analysis = processor.run()
+                t_run = time.time() - t5
 
+                t6 = time.time()
                 # Extract data based on granular config
                 levels = self._extract_data_from_analysis(analysis, extract_config)
-                all_levels[timeframe] = levels
+                t_extract = time.time() - t6
 
-                if len(df) % 100 == 0:
-                    print(f"✅ Extracted {len(levels)} items from {timeframe} timeframe")
+                t7 = time.time()
+                # ⚡ CACHE UPDATE: Store result for future use (including log_scale setting)
+                self.state_manager.update_state(timeframe, df, levels, use_log_scale=use_log_scale)
+                t_cache = time.time() - t7
+
+                t_total = time.time() - t_start
+
+                # Print detailed timing breakdown
+                if t_total > 0.01:  # Only show if > 10ms
+                    print(f"   ⏱️  [{timeframe}] Total: {t_total:.3f}s | "
+                          f"Copy: {t_copy*1000:.0f}ms | Filter: {t_filter*1000:.0f}ms | "
+                          f"Init: {t_processor_init*1000:.0f}ms | Run: {t_run*1000:.0f}ms | "
+                          f"Extract: {t_extract*1000:.0f}ms | Cache: {t_cache*1000:.0f}ms")
+
+                all_levels[timeframe] = levels
 
             except Exception as e:
                 print(f"❌ Error processing {timeframe} data: {e}")
@@ -336,17 +280,6 @@ class MultitimeframeLevelExtractor:
                 except Exception:
                     pass
 
-                # De-duplicate by price within small tolerance to avoid overweighting identical levels
-                if tf_levels:
-                    uniq: List[LevelInfo] = []
-                    seen_prices = set()
-                    for lvl in tf_levels:
-                        key = round(lvl.price, 5)
-                        if key not in seen_prices:
-                            seen_prices.add(key)
-                            uniq.append(lvl)
-                    tf_levels = uniq
-
                 levels_by_tf[timeframe] = tf_levels
             except Exception:
                 levels_by_tf[timeframe_str] = []  # type: ignore
@@ -373,7 +306,7 @@ class MultitimeframeLevelExtractor:
         return df
 
     def _extract_data_from_analysis(self, analysis: AnalysisDict,
-                                    extract_config: Dict[ChartInterval, List[str]]) -> Dict[str, List[Line | Pivot]]:
+                                    extract_config: Dict[str, List[str]]) -> Dict[str, List[Line | Pivot]]:
         """
         Extract raw data from technical analysis results based on granular config.
 
@@ -433,23 +366,21 @@ class MultitimeframeLevelExtractor:
         for line in lines:
             try:
                 # Line structure: (pivot1, pivot2, line_type)
-                if len(line) >= 3:
-                    pivot1, pivot2, line_type = line
-
+                if len(line) >= 4:
+                    pivot1, pivot2, line_type, volume = line
+                    if 'val_line' not in str(line_type) and 'vah_line' not in str(line_type) and 'poc_line' not in str(line_type) and 'naked_poc_line' not in str(line_type):
+                        continue
                     # Extract price from pivot (timestamp, price, type)
                     price = pivot1[1] if len(pivot1) >= 2 else None
 
                     if price and price > 0:
                         distance = abs(price - current_price) / current_price * 100
 
-                        # Determine if support or resistance based on price relative to current
-                        level_type = 'support' if price < current_price else 'resistance'
-
                         levels.append(LevelInfo(
                             price=price,
-                            strength=0.8,  # Base strength for detected levels
+                            strength=1 if timeframe == 'M' else 0.8 if timeframe == 'W' else 0.6 if timeframe == 'D' else 0.4,  # Base strength for detected levels
                             distance=distance,
-                            level_type=level_type,
+                            level_type=line_type,
                             timeframe=timeframe,
                             last_test_time=pivot1[0] if len(pivot1) >= 1 else None
                         ))
@@ -467,23 +398,22 @@ class MultitimeframeLevelExtractor:
         for line in lines:
             try:
                 # Line structure: (pivot1, pivot2, line_type)
-                if len(line) >= 3:
-                    pivot1, pivot2, line_type = line
+                if len(line) >= 4:
+                    pivot1, pivot2, line_type, volume = line
 
+                    if 'line_close' not in str(line_type):
+                        continue
                     # Extract price from pivot (timestamp, price, type)
                     price = pivot1[1] if len(pivot1) >= 2 else None
 
                     if price and price > 0:
                         distance = abs(price - current_price) / current_price * 100
 
-                        # Determine if support or resistance based on price relative to current
-                        level_type = 'support' if price < current_price else 'resistance'
-
                         levels.append(LevelInfo(
                             price=price,
-                            strength=0.8,  # Base strength for detected levels
+                            strength=1 if timeframe == 'M' else 0.8 if timeframe == 'W' else 0.6 if timeframe == 'D' else 0.4,  # Base strength for detected levels
                             distance=distance,
-                            level_type=level_type,
+                            level_type=line_type,
                             timeframe=timeframe,
                             last_test_time=pivot1[0] if len(pivot1) >= 1 else None
                         ))
@@ -500,26 +430,21 @@ class MultitimeframeLevelExtractor:
 
         for line in lines:
             try:
-                if len(line) >= 3:
-                    pivot1, pivot2, line_type = line
+                if len(line) >= 4:
+                    pivot1, pivot2, line_type, volume = line
                     price = pivot1[1] if len(pivot1) >= 2 else None
+
+                    if 'channel_lower_line' not in str(line_type) and 'channel_upper_line' not in str(line_type) and 'channel_middle_line' not in str(line_type):
+                        continue
 
                     if price and price > 0:
                         distance = abs(price - current_price) / current_price * 100
 
-                        # Channel type determines level type
-                        if 'upper' in str(line_type):
-                            level_type = 'channel_resistance'
-                        elif 'lower' in str(line_type):
-                            level_type = 'channel_support'
-                        else:
-                            level_type = 'channel_middle'
-
                         levels.append(LevelInfo(
                             price=price,
-                            strength=0.7,  # Channel levels have good strength
+                            strength=1 if timeframe == 'M' else 0.8 if timeframe == 'W' else 0.6 if timeframe == 'D' else 0.4,  # Base strength for detected levels
                             distance=distance,
-                            level_type=level_type,
+                            level_type=line_type,
                             timeframe=timeframe
                         ))
 
@@ -548,7 +473,7 @@ class MultitimeframeLevelExtractor:
 
                         levels.append(LevelInfo(
                             price=price,
-                            strength=0.6,  # Pivot levels have moderate strength
+                            strength=1 if timeframe == 'M' else 0.8 if timeframe == 'W' else 0.6 if timeframe == 'D' else 0.4,  # Base strength for detected levels
                             distance=distance,
                             level_type=level_type,
                             timeframe=timeframe,

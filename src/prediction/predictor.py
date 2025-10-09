@@ -24,35 +24,14 @@ class SimpleModelPredictor:
         self.trader = AutonomousTrader()
 
     def _load_json_data(self, file_path: str) -> Optional[pd.DataFrame]:
-        """Load JSON data and convert to DataFrame"""
-        try:
-            with open(file_path, 'r') as f:
-                data = json.load(f)
-
-            df = pd.DataFrame(data['candles'])
-            df['datetime'] = pd.to_datetime(df['time'], unit='s')
-
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-
-            return df.sort_values('datetime').reset_index(drop=True)
-        except Exception as e:
-            print(f"Error loading {file_path}: {e}")
-            return None
+        """Load JSON data and convert to DataFrame using centralized DataLoader"""
+        from training.data_loader import DataLoader
+        return DataLoader.load_single_json_file(file_path)
 
     def _get_symbol_files(self, symbol: str, data_folder: str = 'data_test') -> Dict[str, str]:
-        """Get available files for a symbol"""
-        files = {}
-        for tf in ['15m', '1h', 'D', 'W', 'M']:
-            path = f'{data_folder}/{symbol}-{tf}.json'
-            if os.path.exists(path):
-                files[tf] = path
-                continue
-            alt_path = f'{data_folder}/{symbol}-{tf} (1).json'
-            if os.path.exists(alt_path):
-                files[tf] = alt_path
-        return files
+        """Get available files for a symbol using centralized DataLoader"""
+        from training.data_loader import DataLoader
+        return DataLoader.get_symbol_files(symbol, data_folder)
 
     def generate_predictions(self, symbol: str, num_candles: int = 200,
                              data_folder: str = 'data_test',

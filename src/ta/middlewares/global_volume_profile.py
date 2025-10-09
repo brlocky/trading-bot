@@ -29,19 +29,42 @@ def calculate_key_volume_levels_fast(
     bins: int = 100
 ) -> VolumeProfileKeyLevels:
     """
-    OPTIMIZED: Calculate only POC, VAH, VAL without full histogram.
-    Much faster when you only need key levels.
+    OPTIMIZED: Calculate only POC, VAH, VAL with GPU acceleration.
+    Automatically uses GPU if available, falls back to CPU.
     """
     if prices.size == 0 or volumes.size == 0:
         raise ValueError("Price and volume arrays must not be empty.")
 
-    min_price = float(np.min(prices))
-    max_price = float(np.max(prices))
+    # GPU-accelerated operations
+    try:
+        from ta.gpu_utils import GPUArrayOps
+        ops = GPUArrayOps()  # Auto-detects GPU
+    except ImportError:
+        # Fallback to plain numpy if gpu_utils not available
+        class FallbackOps:
+            def asarray(self, x): return np.asarray(x)
+            def asnumpy(self, x): return np.asarray(x)
+            def min(self, x, **kw): return np.min(x, **kw)
+            def max(self, x, **kw): return np.max(x, **kw)
+            def sum(self, x, **kw): return np.sum(x, **kw)
+            def arange(self, *args, **kw): return np.arange(*args, **kw)
+            def digitize(self, x, bins): return np.digitize(x, bins)
+            def clip(self, x, a, b): return np.clip(x, a, b)
+            def bincount(self, x, **kw): return np.bincount(x, **kw)
+            def argmax(self, x, **kw): return np.argmax(x, **kw)
+        ops = FallbackOps()
+
+    # Move to GPU
+    prices_gpu = ops.asarray(prices)
+    volumes_gpu = ops.asarray(volumes)
+
+    min_price = float(ops.min(prices_gpu))
+    max_price = float(ops.max(prices_gpu))
     price_range = max_price - min_price
 
     # Handle single price case
     if price_range == 0.0:
-        total_vol = float(np.sum(volumes))
+        total_vol = float(ops.sum(volumes_gpu))
         return {
             'poc_price': min_price,
             'poc_volume': total_vol,
@@ -51,49 +74,53 @@ def calculate_key_volume_levels_fast(
             'val_volume': total_vol
         }
 
-    # Use fewer bins for faster calculation (we only need key levels)
+    # GPU-accelerated binning
     bin_size = price_range / bins
-    bin_edges = np.arange(min_price, max_price + bin_size, bin_size)
+    bin_edges = ops.arange(min_price, max_price + bin_size, bin_size)
 
-    # Vectorized binning - much faster than list comprehension
-    bin_indices = np.digitize(prices, bin_edges) - 1
-    bin_indices = np.clip(bin_indices, 0, len(bin_edges) - 2)
+    # Vectorized binning on GPU
+    bin_indices = ops.digitize(prices_gpu, bin_edges) - 1
+    bin_indices = ops.clip(bin_indices, 0, len(bin_edges) - 2)
 
-    # Fast histogram calculation using numpy
-    bin_volumes = np.bincount(bin_indices, weights=volumes, minlength=len(bin_edges)-1)
+    # Fast histogram calculation on GPU
+    bin_volumes = ops.bincount(bin_indices, weights=volumes_gpu, minlength=len(bin_edges)-1)
+
+    # Move results back to CPU for processing
+    bin_volumes_cpu = ops.asnumpy(bin_volumes)
+    bin_edges_cpu = ops.asnumpy(bin_edges)
 
     # Find POC
-    poc_idx = np.argmax(bin_volumes)
-    poc_price = (bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2
-    poc_volume = float(bin_volumes[poc_idx])
+    poc_idx = int(ops.argmax(bin_volumes))
+    poc_price = (bin_edges_cpu[poc_idx] + bin_edges_cpu[poc_idx + 1]) / 2
+    poc_volume = float(bin_volumes_cpu[poc_idx])
 
     # Fast Value Area calculation (70% of total volume)
-    total_volume = np.sum(bin_volumes)
+    total_volume = float(ops.sum(bin_volumes))
     value_area_volume = total_volume * 0.70
 
-    # Vectorized expansion from POC
-    accumulated_volume = bin_volumes[poc_idx]
+    # Vectorized expansion from POC (CPU is fine for this small loop)
+    accumulated_volume = bin_volumes_cpu[poc_idx]
     upper_idx = poc_idx
     lower_idx = poc_idx
 
-    while accumulated_volume < value_area_volume and (upper_idx < len(bin_volumes) - 1 or lower_idx > 0):
-        upper_vol = bin_volumes[upper_idx + 1] if upper_idx < len(bin_volumes) - 1 else 0
-        lower_vol = bin_volumes[lower_idx - 1] if lower_idx > 0 else 0
+    while accumulated_volume < value_area_volume and (upper_idx < len(bin_volumes_cpu) - 1 or lower_idx > 0):
+        upper_vol = bin_volumes_cpu[upper_idx + 1] if upper_idx < len(bin_volumes_cpu) - 1 else 0
+        lower_vol = bin_volumes_cpu[lower_idx - 1] if lower_idx > 0 else 0
 
-        if upper_vol >= lower_vol and upper_idx < len(bin_volumes) - 1:
+        if upper_vol >= lower_vol and upper_idx < len(bin_volumes_cpu) - 1:
             upper_idx += 1
-            accumulated_volume += bin_volumes[upper_idx]
+            accumulated_volume += bin_volumes_cpu[upper_idx]
         elif lower_idx > 0:
             lower_idx -= 1
-            accumulated_volume += bin_volumes[lower_idx]
+            accumulated_volume += bin_volumes_cpu[lower_idx]
         else:
             break
 
     # Calculate final VAH/VAL
-    vah_price = bin_edges[upper_idx + 1] if upper_idx < len(bin_edges) - 1 else bin_edges[upper_idx]
-    val_price = bin_edges[lower_idx]
-    vah_volume = float(bin_volumes[upper_idx]) if upper_idx < len(bin_volumes) else 0.0
-    val_volume = float(bin_volumes[lower_idx]) if lower_idx < len(bin_volumes) else 0.0
+    vah_price = bin_edges_cpu[upper_idx + 1] if upper_idx < len(bin_edges_cpu) - 1 else bin_edges_cpu[upper_idx]
+    val_price = bin_edges_cpu[lower_idx]
+    vah_volume = float(bin_volumes_cpu[upper_idx]) if upper_idx < len(bin_volumes_cpu) else 0.0
+    val_volume = float(bin_volumes_cpu[lower_idx]) if lower_idx < len(bin_volumes_cpu) else 0.0
 
     return {
         'poc_price': float(poc_price),

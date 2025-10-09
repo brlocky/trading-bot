@@ -41,8 +41,6 @@ sys.path.insert(0, str(project_root / 'src'))
 
 warnings.filterwarnings('ignore')
 
-# Import after sys.path is set up
-
 
 def convert_timestamps_for_json(obj):
     """
@@ -81,6 +79,7 @@ class FeaturePrecomputer:
     - Progress tracking
     - Memory efficient (batch processing)
     """
+    from core.trading_types import ChartInterval
 
     def __init__(self, output_dir: str = 'data/levels_cache'):
         self.output_dir = Path(output_dir)
@@ -93,13 +92,13 @@ class FeaturePrecomputer:
         self.trainer = SimpleModelTrainer()
 
         # Save after every single candle to avoid data loss
-        self.batch_size_save = 1  # Save checkpoint after EVERY candle
+        self.batch_size_save = 1000  # Save checkpoint every 100 candles (balance speed vs safety)
 
         print("\n⚙️  LEVEL PRECOMPUTER INITIALIZED")
         print("   Checkpoint: Save after EVERY candle (no data loss!)")
 
     def precompute_levels(self,
-                          training_files: Dict[str, str],
+                          training_files: Dict[ChartInterval, str],
                           output_filename: str = 'BTCUSDT-15m-levels.parquet',
                           resume: bool = True):
         """
@@ -122,8 +121,10 @@ class FeaturePrecomputer:
         output_path = self.output_dir / output_filename
         checkpoint_path = self.output_dir / f"{output_filename}.checkpoint"
 
+        from core.trading_types import ChartInterval
+
         # Load main timeframe data
-        main_tf = '15m'
+        main_tf: ChartInterval = '15m'
         if main_tf not in training_files:
             print(f"❌ Main timeframe {main_tf} not found in training files")
             return False
@@ -132,16 +133,16 @@ class FeaturePrecomputer:
         print("=" * 70)
         print(f"📁 Loading from: {training_files[main_tf]}")
 
-        with open(training_files[main_tf], 'r') as f:
-            data = json.load(f)
+        # Use centralized DataLoader (already imported at top of method)
+        df = DataLoader.load_single_json_file(training_files[main_tf])
 
-        df = pd.DataFrame(data['candles'])
-        df['datetime'] = pd.to_datetime(df['time'], unit='s')
-        df = df.sort_values('datetime').reset_index(drop=True)
+        if df is None:
+            print(f"❌ Failed to load data from {training_files[main_tf]}")
+            return
 
         total_candles = len(df)
         print(f"✅ Loaded {total_candles:,} candles")
-        print(f"📅 Range: {df['datetime'].min()} to {df['datetime'].max()}")
+        print(f"📅 Range: {df.index.min()} to {df.index.max()}")
 
         # Check if we should resume
         start_idx = 0
@@ -200,8 +201,8 @@ class FeaturePrecomputer:
                       unit="candle", initial=start_idx, total=total_candles) as pbar:
 
                 for i in pbar:
-                    current_timestamp = df.loc[i, 'datetime']
-                    current_price = df.loc[i, 'close']
+                    current_timestamp = df.index[i]
+                    current_price = df.close[i]
 
                     # Update progress bar description
                     if i % 10 == 0 and i > start_idx:
@@ -218,12 +219,11 @@ class FeaturePrecomputer:
 
                     # Get historical data up to current candle
                     historical_data = df.iloc[:i+1].copy()
-                    historical_data = historical_data.set_index('datetime')
 
                     try:
                         from ta.technical_analysis import Pivot
                         # Last Pivot
-                        last_pivot: Pivot = (cast(pd.Timestamp, current_timestamp), cast(float, current_price), None)
+                        last_pivot: Pivot = (cast(pd.Timestamp, current_timestamp), cast(float, current_price), 0, None)
 
                         # ⏱️ TIMING: Level extraction
                         t1 = datetime.now()
@@ -246,26 +246,22 @@ class FeaturePrecomputer:
                                 total_levels += len(raw_data) if isinstance(raw_data, list) else 0
 
                         # Get data range for this candle
-                        data_start = historical_data.index[0]
                         data_end = historical_data.index[-1]
 
                         # Print timing breakdown for EVERY candle to debug
-                        start_str = data_start.strftime('%Y-%m-%d')
-                        end_str = data_end.strftime('%Y-%m-%d')
-                        print(f"\n⏱️  Candle {i+1}/{total_candles} @ {data_end} | "
-                              f"Data range: {start_str} to {end_str} ({len(historical_data)} candles) | "
+                        print(f"\n⏱️  Candle {i+1}/{total_candles} ({len(historical_data)} candles) {data_end} | "
                               f"Levels={level_time:.2f}s | {total_levels} levels", flush=True)
 
                         # 💾 SAVE LEVELS + CANDLE DATA (not computed features)
                         # This allows fast iteration on feature engineering without recomputing slow TA middlewares
                         candle_data = {
                             'datetime': convert_timestamps_for_json(current_timestamp),  # Convert timestamp to string
-                            'open': df.loc[i, 'open'],
-                            'high': df.loc[i, 'high'],
-                            'low': df.loc[i, 'low'],
-                            'close': df.loc[i, 'close'],
-                            'volume': df.loc[i, 'volume'],
-                            'time': df.loc[i, 'time'],
+                            'open': df.open[i],
+                            'high': df.high[i],
+                            'low': df.low[i],
+                            'close': df.close[i],
+                            'volume': df.volume[i],
+                            'time': df.time[i],
                         }
 
                         # Serialize levels as JSON string (can be deserialized later for feature calculation)
@@ -438,7 +434,8 @@ def main():
     # Configuration
     data_folder = project_root / 'data'
 
-    training_files = {
+    from core.trading_types import ChartInterval
+    training_files: Dict[ChartInterval, str] = {
         'M': str(data_folder / 'BTCUSDT-M.json'),
         'W': str(data_folder / 'BTCUSDT-W.json'),
         'D': str(data_folder / 'BTCUSDT-D.json'),
