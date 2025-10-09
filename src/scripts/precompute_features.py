@@ -2,42 +2,37 @@
 Level Pre-computation Script (TA Middleware Cache)
 ===================================================
 
-Progressively extracts levels from TA middlewares and saves to Parquet file.
-
-WHY: Level extraction (zigzag, volume profile, channels) is SLOW (1.3s per candle).
-     Feature engineering (distances, weights) is FAST (0.02s).
-
-STRATEGY:
-- Pre-compute: LEVELS (slow TA middlewares) → Save to Parquet
-- On-demand: FEATURES (fast calculations) → Compute during training/testing
-- Benefit: Quickly iterate on feature engineering without recomputing middlewares!
-
-OUTPUT: Parquet file with:
-- OHLCV data
-- Extracted levels (serialized JSON)
-- Timestamp
-
-Features are calculated on-demand from this cached data during training.
+Caches slow TA middleware results (zigzag, channels, volume profile) to Parquet files.
+Features are calculated on-demand during training for fast iteration.
 
 USAGE:
+    # Process default symbol (BTCUSDT)
     python src/scripts/precompute_features.py
+    
+    # Process specific symbol
+    python src/scripts/precompute_features.py --symbol ETHUSDT
+    
+    # Process multiple symbols
+    python src/scripts/precompute_features.py --symbol BTCUSDT ETHUSDT SOLUSDT
+    
+    # Process all symbols
+    python src/scripts/precompute_features.py --all
 """
 
-from pathlib import Path
-import sys
+import argparse
 import json
-import pandas as pd
-
-from tqdm import tqdm
-from datetime import datetime
-from typing import Dict, List, Optional, cast
+import sys
 import warnings
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, cast
 
+import pandas as pd
+from tqdm import tqdm
 
-# Add src to path - do this BEFORE importing local modules
-project_root = Path(__file__).parent.parent.parent  # Go up from src/scripts/ to project root
+# Add src to path
+project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root / 'src'))
-
 
 warnings.filterwarnings('ignore')
 
@@ -424,78 +419,179 @@ class FeaturePrecomputer:
             raise  # Re-raise so caller knows save failed
 
 
-def main():
-    """Main execution"""
-    print("=" * 70)
-    print("🚀 FEATURE PRE-COMPUTATION SCRIPT")
-    print("   GPU-Accelerated Progressive Feature Calculator")
-    print("=" * 70)
+def process_symbol(symbol: str, data_folder: Path, resume: bool = True) -> bool:
+    """
+    Process a single symbol and cache its levels
 
-    # Configuration
-    data_folder = project_root / 'data'
+    Args:
+        symbol: Trading pair (e.g., 'BTCUSDT')
+        data_folder: Path to data directory
+        resume: Continue from checkpoint if available
 
+    Returns:
+        bool: Success status
+    """
     from core.trading_types import ChartInterval
+
+    print(f"\n{'='*70}")
+    print(f"📊 PROCESSING: {symbol}")
+    print(f"{'='*70}")
+
+    # Build file paths for all timeframes
     training_files: Dict[ChartInterval, str] = {
-        'M': str(data_folder / 'BTCUSDT-M.json'),
-        'W': str(data_folder / 'BTCUSDT-W.json'),
-        'D': str(data_folder / 'BTCUSDT-D.json'),
-        '1h': str(data_folder / 'BTCUSDT-1h.json'),
-        '15m': str(data_folder / 'BTCUSDT-15m.json'),
+        'M': str(data_folder / f'{symbol}-M.json'),
+        'W': str(data_folder / f'{symbol}-W.json'),
+        'D': str(data_folder / f'{symbol}-D.json'),
+        '1h': str(data_folder / f'{symbol}-1h.json'),
+        '15m': str(data_folder / f'{symbol}-15m.json'),
     }
 
-    # Check files exist
+    # Check if all required files exist
     print("\n📋 Checking data files:")
+    missing = []
     for tf, path in training_files.items():
-        exists = "✅" if Path(path).exists() else "❌"
         if Path(path).exists():
             size_mb = Path(path).stat().st_size / 1024 / 1024
-            print(f"   {tf:4s}: {exists} {Path(path).name:30s} ({size_mb:.1f} MB)")
+            print(f"   {tf:4s}: ✅ {Path(path).name:30s} ({size_mb:.1f} MB)")
         else:
-            print(f"   {tf:4s}: {exists} {Path(path).name:30s} (NOT FOUND)")
+            print(f"   {tf:4s}: ❌ {Path(path).name:30s} (NOT FOUND)")
+            missing.append(tf)
 
-    missing = [tf for tf, path in training_files.items() if not Path(path).exists()]
     if missing:
-        print(f"\n❌ Missing files for timeframes: {missing}")
-        print(f"   Please ensure all data files are in: {data_folder}")
-        return
+        print(f"\n❌ Missing files for {symbol}: {missing}")
+        print("   Skipping this symbol...")
+        return False
 
     # Initialize precomputer
     print("\n⚙️  Initializing level precomputer...")
     precomputer = FeaturePrecomputer(output_dir=str(data_folder / 'levels_cache'))
 
-    # Pre-compute levels (TA middleware results)
-    print("\n" + "=" * 70)
-    print("⚡ STARTING LEVEL PRE-COMPUTATION (TA Middleware Cache)")
-    print("   Caching SLOW TA middlewares (zigzag, volume profile, channels)")
-    print("   Features will be calculated on-demand (fast iteration!)")
-    print("   You can pause with Ctrl+C and resume later")
-    print("=" * 70)
+    # Pre-compute levels
+    output_filename = f'{symbol}-15m-levels.parquet'
 
     try:
         success = precomputer.precompute_levels(
             training_files=training_files,
-            output_filename='BTCUSDT-15m-levels.parquet',
-            resume=True
+            output_filename=output_filename,
+            resume=resume
         )
 
         if success:
-            print("\n🎉 SUCCESS! Levels pre-computed and cached!")
-            print("   Now you can quickly iterate on feature engineering")
-            print("\n📚 Next steps:")
-            print("   1. Modify feature weights in feature_engineer.py")
-            print("   2. Train model: It will load cached levels and compute features instantly")
-            print("   3. Iterate fast without recomputing slow TA middlewares!")
+            print(f"\n✅ {symbol} levels cached successfully!")
         else:
-            print("\n⚠️  Level pre-computation incomplete")
-            print("   Run again to resume from checkpoint")
+            print(f"\n⚠️  {symbol} pre-computation incomplete")
+
+        return success
+
+    except KeyboardInterrupt:
+        print(f"\n\n⚠️  {symbol} interrupted by user")
+        print("   Progress saved. Run again to resume.")
+        raise  # Re-raise to stop processing other symbols
+    except Exception as e:
+        print(f"\n❌ Error processing {symbol}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def main():
+    """Main execution with command-line argument support"""
+    parser = argparse.ArgumentParser(
+        description='Pre-compute TA middleware levels for trading symbols',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python src/scripts/precompute_features.py
+  python src/scripts/precompute_features.py --symbol ETHUSDT
+  python src/scripts/precompute_features.py --symbol BTCUSDT ETHUSDT SOLUSDT
+  python src/scripts/precompute_features.py --all
+        """
+    )
+
+    parser.add_argument(
+        '--symbol', '-s',
+        nargs='+',
+        default=['BTCUSDT'],
+        help='Symbol(s) to process (default: BTCUSDT)'
+    )
+
+    parser.add_argument(
+        '--all',
+        action='store_true',
+        help='Process all symbols found in data folder'
+    )
+
+    parser.add_argument(
+        '--no-resume',
+        action='store_true',
+        help='Start from scratch (ignore checkpoints)'
+    )
+
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("🚀 LEVEL PRE-COMPUTATION SCRIPT")
+    print("   Caching slow TA middlewares for fast feature iteration")
+    print("=" * 70)
+
+    data_folder = project_root / 'data'
+    resume = not args.no_resume
+
+    # Determine which symbols to process
+    if args.all:
+        # Find all symbols with 15m data files
+        symbols = set()
+        for file in data_folder.glob('*-15m.json'):
+            symbol = file.stem.replace('-15m', '')
+            symbols.add(symbol)
+
+        if not symbols:
+            print(f"\n❌ No data files found in {data_folder}")
+            return
+
+        symbols = sorted(symbols)
+        print(f"\n📊 Found {len(symbols)} symbols: {', '.join(symbols)}")
+    else:
+        symbols = args.symbol
+        print(f"\n📊 Processing {len(symbols)} symbol(s): {', '.join(symbols)}")
+
+    # Process each symbol
+    results = {}
+    total_start = datetime.now()
+
+    try:
+        for i, symbol in enumerate(symbols, 1):
+            print(f"\n{'='*70}")
+            print(f"[{i}/{len(symbols)}] {symbol}")
+            print(f"{'='*70}")
+
+            success = process_symbol(symbol, data_folder, resume)
+            results[symbol] = success
+
+        # Summary
+        total_time = (datetime.now() - total_start).total_seconds()
+        successful = sum(1 for s in results.values() if s)
+
+        print("\n" + "=" * 70)
+        print("🎉 BATCH COMPLETE!")
+        print("=" * 70)
+        print(f"✅ Successful: {successful}/{len(symbols)}")
+        print(f"⏱️  Total time: {total_time/60:.1f} minutes")
+
+        if successful < len(symbols):
+            print("\n⚠️  Failed symbols:")
+            for symbol, success in results.items():
+                if not success:
+                    print(f"   ❌ {symbol}")
+
+        print("\n📚 Next steps:")
+        print("   1. Train models using cached levels")
+        print("   2. Iterate on feature engineering (instant!)")
+        print("   3. Backtest with progressive signals")
 
     except KeyboardInterrupt:
         print("\n\n⚠️  Interrupted by user")
-        print("   Progress has been saved. Run again to resume.")
-    except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
+        print("   All progress has been saved. Run again to continue.")
 
 
 if __name__ == '__main__':
