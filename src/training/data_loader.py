@@ -1,150 +1,287 @@
-"""
-DataLoader - Centralized data loading utilities for the trading system
-"""
-
 import json
+from pathlib import Path
+from typing import Dict, List
 import pandas as pd
-from typing import Dict, Optional, List, Any
-import warnings
-import os
-
-
-warnings.filterwarnings('ignore')
+from indicator_utils import add_indicators
+from core.trading_types import ChartInterval
+from core.normalization_config import get_default_feature_normalization, get_timeframe_indicators
 
 
 class DataLoader:
-    """Centralized DataLoader for loading and preprocessing trading data from JSON files."""
+    """
+    Enhanced DataLoader for the trading bot.
+    Handles loading of candle data from JSON files and precomputed levels from Parquet files.
+    """
 
-    @staticmethod
-    def load_single_json_file(file_path: str) -> Optional[pd.DataFrame]:
+    def __init__(self, data_dir: str = 'data', levels_cache_dir: str | None = None):
         """
-        Load a single JSON file and convert to DataFrame with proper data types.
+        Initialize the DataLoader with data directories.
 
         Args:
-            file_path: Path to the JSON file
+            data_dir: Directory containing candle data files
+            levels_cache_dir: Directory containing precomputed levels (defaults to data_dir/levels_cache)
+        """
+        self.data_dir = Path(data_dir)
+        if levels_cache_dir is None:
+            self.levels_cache_dir = self.data_dir / 'levels_cache'
+        else:
+            self.levels_cache_dir = Path(levels_cache_dir)
+
+    def recalculate_higher_timeframe_indicator(self, source_df: pd.DataFrame, target_df: pd.DataFrame,
+                                               source_timeframe: ChartInterval, target_tf: ChartInterval,
+                                               indicator: str) -> pd.DataFrame:
+        """
+        Interpolate higher timeframe indicators to target timeframe using merge_asof for efficient alignment.
+
+        Args:
+            source_df: DataFrame containing source timeframe data (higher TF, fewer rows)
+            target_df: DataFrame containing target timeframe data (lower TF, more rows)
+            source_timeframe: The source timeframe of the data (e.g., '1h', 'D', 'W', 'M')
+            target_timeframe: The target timeframe to add indicators to (e.g., '15m')
+            indicator: The specific indicator to interpolate
 
         Returns:
-            DataFrame with candle data or None if error
+            Updated target_df with interpolated higher timeframe indicator
+        """
+
+        # Define timeframe hierarchy (minutes)
+        tf_hierarchy = {'15m': 15, '1h': 60, 'D': 1440, 'W': 10080, 'M': 43200}
+
+        print(f"🔄 Interpolating {indicator} from {source_timeframe} to {target_tf}...")
+
+        if source_timeframe == target_tf:
+            raise ValueError("Source and target timeframes must be different for interpolation")
+
+        # Ensure we're interpolating from higher to lower timeframe
+        if tf_hierarchy.get(source_timeframe, 0) <= tf_hierarchy.get(target_tf, 0):
+            raise ValueError(f"Source timeframe '{source_timeframe}' must be higher than target timeframe '{target_tf}'")
+
+        if indicator not in source_df.columns:
+            raise ValueError(f"Indicator '{indicator}' not found in source dataframe columns")
+
+        try:
+            print(f"  📊 Source ({source_timeframe}): {len(source_df)} rows")
+            print(f"  📊 Target ({target_tf}): {len(target_df)} rows")
+
+            # Create new column name
+            new_col_name = f"{indicator}_{source_timeframe}"
+
+            # Prepare source data with timestamp as column (not index)
+            source_temp = source_df.reset_index()[[source_df.index.name or 'datetime', indicator]].copy()
+            source_temp = source_temp.rename(columns={source_df.index.name or 'datetime': 'timestamp'})
+            source_temp['timestamp'] = pd.to_datetime(source_temp['timestamp'])
+
+            # Prepare target data with timestamp as column
+            target_temp = target_df.reset_index()[[target_df.index.name or 'datetime']].copy()
+            target_temp = target_temp.rename(columns={target_df.index.name or 'datetime': 'timestamp'})
+            target_temp['timestamp'] = pd.to_datetime(target_temp['timestamp'])
+
+            # Remove NaN values from source
+            source_clean = source_temp.dropna(subset=[indicator])
+
+            if len(source_clean) == 0:
+                print(f"⚠️ No valid data for {indicator} in {source_timeframe}")
+                raise ValueError(f"No valid data for {indicator} in {source_timeframe}")
+
+            # Sort both by timestamp (required for merge_asof)
+            source_clean = source_clean.sort_values('timestamp')
+            target_temp = target_temp.sort_values('timestamp')
+
+            # Use merge_asof for backward search (each target gets most recent source value)
+            merged = pd.merge_asof(
+                target_temp,
+                source_clean[['timestamp', indicator]],
+                on='timestamp',
+                direction='backward'  # Each target timestamp gets the most recent source value at or before it
+            )
+
+            # Add interpolated values back to target dataframe
+            target_df[new_col_name] = merged[indicator].values
+
+            # Count how many values were successfully interpolated
+            valid_count = pd.notna(merged[indicator]).sum()
+            print(f"  ✅ Interpolated {valid_count:,}/{len(target_df):,} values for {new_col_name}")
+
+        except Exception as e:
+            print(f"❌ Error interpolating {source_timeframe} → {target_tf}: {e}")
+            # Add column with NaN values as fallback
+            target_df[f"{indicator}_{source_timeframe}"] = pd.NA
+            raise e
+
+        return target_df
+
+    def load_data(self,
+                  symbol: str,
+                  timeframes: List[ChartInterval] = ['15m', '1h', 'D', 'W', 'M'],
+                  target_tf: ChartInterval = '15m') -> Dict[ChartInterval, pd.DataFrame]:
+        """
+        Enhanced data loading with multi-timeframe indicator configuration
         """
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            print(f"📥 Loading data for {symbol}...")            # Step 1: Load candle data for all timeframes
+            candle_files = self._build_candle_file_config(symbol, timeframes)
+            dfs = self._load_files(candle_files)
 
-            # Handle different JSON structures
-            candles = data.get('candles', data) if isinstance(data, dict) else data
+            # Step 2: Calculate timeframe-specific indicators
+            print("🔧 Adding timeframe-specific technical indicators...")
+            for tf, df in dfs.items():
+                add_indicators(df)
 
-            if not candles:
-                print(f"⚠️  No candle data found in {file_path}")
-                return None
+            # Step 3: Load and merge levels cache with target timeframe
+            if target_tf not in dfs:
+                raise ValueError(f"Target timeframe '{target_tf}' not found in loaded dataframes")
 
-            df = pd.DataFrame(candles)
+            levels_df = self.load_parquet(symbol, target_tf)
 
-            # Standardize datetime column
-            if 'time' in df.columns:
+            # Merge levels with target timeframe candle data
+            target_df = dfs[target_tf]
+
+            # Align indices
+            target_df = target_df.reindex(target_df.index)
+            levels_df = levels_df.reindex(levels_df.index)
+
+            # Copy levels_json column if exists
+            if 'levels_json' not in levels_df.columns:
+                raise ValueError("Levels DataFrame must contain 'levels_json' column")
+
+            target_df['levels_json'] = levels_df['levels_json'].copy()
+
+            # Step 4: Interpolate higher timeframe indicators to target timeframe
+            if len(timeframes) > 1:
+                print(f"🔄 Recalculating higher timeframe indicators for {target_tf}...")
+
+                # Use the complete feature list from configuration
+                features_list = list(get_default_feature_normalization().keys())
+                timeframe_indicators = get_timeframe_indicators()
+
+                for tf in timeframes:
+                    if tf == target_tf:
+                        continue
+                    if tf not in dfs:
+                        raise ValueError(f"Timeframe '{tf}' not found in loaded dataframes")
+
+                    # Get indicators for this timeframe from configuration
+                    tf_indicators = list(timeframe_indicators.get(tf, set()))
+                    for indicator in tf_indicators:
+                        source_df = dfs[tf]
+                        if indicator not in source_df.columns:
+                            raise ValueError(f"Indicator '{indicator}' not found in {tf} dataframe")
+
+                        # Construct target column name
+                        target_col_name = f"{indicator}_{tf}"
+
+                        # Only process if the indicator is in the features list
+                        if target_col_name not in features_list:
+                            continue
+
+                        # Interpolate indicator from tf to target_tf
+
+                        # 1. Copy only the indicator from the source
+                        source_copy = source_df[[indicator]].copy()
+
+                        # 2. Expand to match target index and interpolate
+                        expanded = source_copy.reindex(target_df.index.union(source_copy.index)).sort_index()
+                        expanded[indicator] = expanded[indicator].interpolate(method='time')
+
+                        # 3. Assign interpolated values to target
+                        target_df[target_col_name] = expanded.reindex(target_df.index)[indicator]
+
+                        # Copy indicator values to target dataframe (will be re-interpolated later)
+                        """ target_df[target_col_name] = self.recalculate_higher_timeframe_indicator(
+                            source_df=dfs[tf], target_df=target_df, source_timeframe=tf, target_tf=target_tf,  indicator=indicator
+                        ) """
+
+            # Step 5: Store the processed target dataframe back into the dictionary
+            dfs[target_tf] = target_df
+
+            return dfs
+
+        except Exception as e:
+            raise RuntimeError(f"❌ Error loading data for {symbol}: {str(e)}")
+
+    def _load_files(self, file_config: Dict[ChartInterval, str]) -> Dict[ChartInterval, pd.DataFrame]:
+        """
+        Load dataframes from JSON files for multiple timeframes.
+
+        Args:
+            file_config: Dict mapping timeframes to file paths
+
+        Returns:
+            Dict mapping timeframes to loaded dataframes
+        """
+        result = {}
+        for tf, file_path in file_config.items():
+            try:
+                path = Path(file_path)
+                if not path.exists():
+                    raise FileNotFoundError(f"⚠️ Warning: File not found: {file_path}")
+
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                    df = pd.DataFrame(data['candles'])
+
+                # Convert timestamp to datetime and set as index
                 df['datetime'] = pd.to_datetime(df['time'], unit='s')
-                df = df.set_index('datetime')
-                # Note: Using 'datetime' as the standard timestamp column
+                df.set_index('datetime', inplace=True)
+                result[tf] = df
 
-            # Convert numeric columns with error handling
-            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-            for col in numeric_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            except Exception as e:
+                raise ValueError(f"❌ Error loading {tf} data from {file_path}: {str(e)}")
 
-            return df
+        return result
 
-        except Exception as e:
-            print(f"❌ Error loading {file_path}: {e}")
-            return None
-
-    @staticmethod
-    def load_multiple_json_files(
-        file_paths: Dict[Any, str],
-        exclude_keys: Optional[List[str]] = None,
-        set_timestamp_index: bool = True
-    ) -> Dict[Any, pd.DataFrame]:
+    def load_parquet(self, symbol: str, timeframe: str = '15m') -> pd.DataFrame:
         """
-        Load multiple JSON files into DataFrames.
+        Load precomputed levels from Parquet file.
 
         Args:
-            file_paths: Dict of timeframe -> file path
-            exclude_keys: List of keys to exclude from loading (e.g., ['parquet_path'])
-            set_timestamp_index: Whether to set timestamp as index
+            symbol: Trading symbol
+            timeframe: Timeframe for the levels
 
         Returns:
-            Dict of timeframe -> DataFrame
+            DataFrame with levels data or None if not found
         """
-        exclude_keys = exclude_keys or ['parquet_path']
-        dataframes = {}
+        parquet_path = self.levels_cache_dir / f"{symbol}-{timeframe}-levels.parquet"
+        if not parquet_path.exists():
+            print(f"⚠️ Warning: Parquet cache not found: {parquet_path}")
+            raise FileNotFoundError(f"Parquet cache not found: {parquet_path}")
 
-        print("\n📂 PRE-LOADING ALL DATA FILES (one-time operation)...")
-
-        for timeframe, file_path in file_paths.items():
-            # Skip excluded keys
-            if timeframe in exclude_keys:
-                print(f"   Skipping {timeframe} (excluded)")
-                continue
-
-            print(f"   Loading {timeframe}...", end='', flush=True)
-
-            df = DataLoader.load_single_json_file(file_path)
-            if df is not None:
-                dataframes[timeframe] = df
-                print(f" ✅ {len(df):,} candles")
-            else:
-                print(f" ❌ Failed to load")
-
-        print("✅ All data files loaded into memory!\n")
-        return dataframes
-
-    @staticmethod
-    def load_trade_memory_json(file_path: str) -> Optional[List[dict]]:
-        """
-        Load trade memory JSON data (different structure than candle data).
-
-        Args:
-            file_path: Path to trade memory JSON file
-
-        Returns:
-            List of trade dictionaries or None if error
-        """
         try:
-            if not os.path.exists(file_path):
-                return None
+            levels_df = pd.read_parquet(parquet_path)
 
-            with open(file_path, 'r', encoding='utf-8') as f:
-                trade_data = json.load(f)
+            # Ensure the index is a proper DatetimeIndex
+            if not isinstance(levels_df.index, pd.DatetimeIndex):
+                print("🔧 Converting levels cache index to DatetimeIndex...")
+                levels_df.index = pd.to_datetime(levels_df.index)
 
-            return trade_data if isinstance(trade_data, list) else None
+            print(f"✅ Loaded levels cache: {parquet_path}")
+            print(f"📊 Shape: {levels_df.shape[0]:,} rows × {levels_df.shape[1]} columns")
 
+            return levels_df
         except Exception as e:
-            print(f"❌ Error loading trade memory {file_path}: {e}")
-            return None
+            raise ValueError(f"❌ Error loading levels cache: {str(e)}")
 
-    @staticmethod
-    def get_symbol_files(symbol: str, data_folder: str = 'data_test') -> Dict[str, str]:
+    def _build_candle_file_config(self, symbol: str, timeframes: List[ChartInterval]) -> Dict[ChartInterval, str]:
         """
-        Get available JSON files for a symbol.
+        Build configuration mapping timeframes to file paths.
 
         Args:
-            symbol: Trading symbol (e.g., 'BTCUSDT')
-            data_folder: Folder containing the data files
+            symbol: Trading symbol
+            timeframes: List of timeframes
 
         Returns:
-            Dict of timeframe -> file path for existing files
+            Dict mapping timeframes to file paths
         """
-        files = {}
-        timeframes = ['15m', '1h', 'D', 'W', 'M']
+        return {
+            tf: str(self.data_dir / f"{symbol}-{tf}.json") for tf in timeframes
+        }
 
-        for tf in timeframes:
-            path = os.path.join(data_folder, f'{symbol}-{tf}.json')
-            if os.path.exists(path):
-                files[tf] = path
+    def _add_technical_indicators(self, dfs: Dict[ChartInterval, pd.DataFrame]):
+        """
+        Add technical indicators to all dataframes.
 
-        return files
-
-    # Legacy method for backward compatibility
-    @staticmethod
-    def _load_dataframes_from_files(level_files: Dict[Any, str]) -> Dict[Any, pd.DataFrame]:
-        """Legacy method - use load_multiple_json_files instead."""
-        return DataLoader.load_multiple_json_files(level_files, set_timestamp_index=True)
+        Args:
+            dfs: Dict mapping timeframes to dataframes
+        """
+        for tf, df in dfs.items():
+            add_indicators(df)

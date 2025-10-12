@@ -184,7 +184,7 @@ class FeaturePrecomputer:
 
         # ⚡ OPTIMIZATION: Pre-load all data files into DataFrames ONCE
         print("\n⚡ OPTIMIZATION: Pre-loading all timeframe data into memory...")
-        level_dataframes = DataLoader._load_dataframes_from_files(training_files)
+        level_dataframes = DataLoader._load_files(training_files)
         print("✅ All data loaded! Now processing will be MUCH faster!\n")
 
         # Process candles progressively

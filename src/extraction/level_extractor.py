@@ -6,6 +6,10 @@ import json
 import pandas as pd
 from typing import Dict, List, cast
 from core.trading_types import ChartInterval, LevelInfo
+from ta.middlewares.channels import channels_middleware
+from ta.middlewares.levels import levels_middleware
+from ta.middlewares.volume_profile import volume_profile_middleware
+from ta.middlewares.zigzag import zigzag_middleware
 from ta.technical_analysis import Line, Pivot, TechnicalAnalysisProcessor, AnalysisDict
 from ta.timeframe_state_manager import TimeframeStateManager
 
@@ -13,10 +17,6 @@ from ta.timeframe_state_manager import TimeframeStateManager
 class MultitimeframeLevelExtractor:
     """
     Extracts data from multiple timeframes using hardcoded extraction strategies.
-
-    Uses AutonomousTrader.get_extraction_config_for_timeframe() to determine:
-    - Which middlewares to run per timeframe
-    - What data to extract (levels, lines, pivots, vp)
 
     OPTIMIZATION: Uses TimeframeStateManager to cache results and avoid
     recalculating unchanged timeframes (5-10x speedup).
@@ -29,6 +29,69 @@ class MultitimeframeLevelExtractor:
         # NEW: Timeframe state management for intelligent caching
         self.state_manager = TimeframeStateManager()
         print("✅ Level extractor initialized with timeframe caching")
+
+    def get_extraction_config_for_timeframe(self, timeframe: str) -> Dict:
+        """
+        Hardcoded extraction configuration per timeframe.
+        Defines which middlewares to run and what data to extract from each.
+
+        Args:
+            timeframe: '15m', '1h', 'D', 'W', 'M'
+
+        Returns:
+            Dict with:
+            - middlewares: List of middlewares to run
+            - extract: Dict mapping middleware_name -> list of data types
+                      e.g., {'zigzag': ['pivots'], 'levels': ['lines']}
+
+        Middleware outputs:
+            - zigzag: ['lines', 'pivots']
+            - levels: ['lines']
+            - channels: ['lines', 'pivots']
+            - volume_profile_periods: ['lines']
+        """
+        configs = {
+            'M': {
+                'middlewares': [zigzag_middleware, levels_middleware, channels_middleware],
+                'extract': {
+                    # 'zigzag': ['pivots'],  # Show all zigzag pivots for analysis
+                    'levels': ['lines'],
+                    'channels': ['lines'],  # Channel lines only
+                }
+            },
+            'W': {
+                'middlewares': [zigzag_middleware, levels_middleware, volume_profile_middleware],
+                'extract': {
+                    # 'zigzag': ['pivots'],  # Show all zigzag pivots for analysis
+                    'levels': ['lines'],
+                    'volume_profile_periods': ['lines']
+                }
+            },
+            'D': {
+                'middlewares': [zigzag_middleware, levels_middleware, volume_profile_middleware],
+                'extract': {
+                    # 'zigzag': ['pivots'],  # Show all zigzag pivots for analysis
+                    'levels': ['lines'],
+                    'volume_profile_periods': ['lines']
+                }
+            },
+            '1h': {
+                'middlewares': [zigzag_middleware, volume_profile_middleware],
+                'extract': {
+                    'zigzag': ['pivots'],
+                    'volume_profile_periods': ['lines']
+                }
+            },
+            '15m': {
+                'middlewares': [zigzag_middleware, volume_profile_middleware],
+                'extract': {
+                    # 'zigzag': ['pivots'],
+                    'volume_profile_periods': ['lines']
+                }
+            }
+        }
+
+        return configs.get(timeframe, {'middlewares': [], 'extract': {}})
 
     def extract_levels_from_dataframes(self,
                                        data_dfs: Dict[ChartInterval, pd.DataFrame],
@@ -48,7 +111,7 @@ class MultitimeframeLevelExtractor:
         Returns:
             Dict mapping timeframe to dict with raw data: {'lines': [], 'pivots': []}
         """
-        from trading.autonomous_trader import AutonomousTrader
+
         max_date = last_pivot[0]
 
         # ⚠️ CRITICAL: Filter all data by max_date FIRST to prevent data leakage
@@ -74,7 +137,7 @@ class MultitimeframeLevelExtractor:
             # Cast string to ChartInterval for type safety
             timeframe: ChartInterval = timeframe_str  # type: ignore  # We know these are valid ChartInterval values
             # Get hardcoded extraction config for this timeframe
-            config = AutonomousTrader.get_extraction_config_for_timeframe(timeframe)
+            config = self.get_extraction_config_for_timeframe(timeframe)
             middlewares = config.get('middlewares', [])
             extract_config = config.get('extract', {})
 
