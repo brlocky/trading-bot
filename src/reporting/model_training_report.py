@@ -1,8 +1,8 @@
 """
-Model Training Report Generator with Enhanced Callback
+Model Training Report Generator with Enhanced Broker Integration
 
-RL training report generator with integrated callback system for real-time data collection.
-Includes comprehensive PPO training performance analysis with text and chart output.
+RL training report generator that uses simplified broker step history for comprehensive
+trading performance analysis with direct line chart visualization.
 """
 
 import json
@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 
 
 class ModelTrainingReport:
-    """Enhanced RL model training report generator with visualization capabilities."""
+    """Enhanced RL model training report generator with simplified broker integration."""
 
     def __init__(self, model_dir: str = 'models/rl_demo'):
         """Initialize the training report generator."""
@@ -54,49 +54,29 @@ class ModelTrainingReport:
     def _load_training_data(self) -> None:
         """Load training data from JSON file"""
         try:
-            # Try to load enhanced training data first (new format)
-            enhanced_data_file = self.model_dir / 'enhanced_training_data.json'
-            if enhanced_data_file.exists():
-                with open(enhanced_data_file, 'r') as f:
-                    self.training_data = json.load(f)
-                print("📊 Loaded enhanced training data with trading metrics")
-                return
-                
             # Fallback to standard training data
-            data_file = self.model_dir / 'training_data.json'
+            data_file = self.model_dir / 'training_logs.json'
             if data_file.exists():
                 with open(data_file, 'r') as f:
                     self.training_data = json.load(f)
                 print("📊 Loaded standard training data")
                 return
-            
-            # Legacy fallback
-            log_file = self.model_dir / 'training_logs.json'
-            if log_file.exists():
-                with open(log_file, 'r') as f:
-                    old_data = json.load(f)
-                # Convert old format to new format
-                self.training_data = self._convert_old_format(old_data)
-                print("📊 Loaded legacy training data")
-                return
-                
+
         except Exception as e:
             print(f"❌ Error loading training data: {e}")
             self.training_data = None
 
     def _analyze_training_performance(self) -> Dict:
-        """Analyze training performance and generate insights"""
+        """Analyze training performance using simplified broker step history"""
         if not self.training_data:
             return {}
 
         session_info = self.training_data.get('session_info', {})
         step_metrics = self.training_data.get('step_metrics', [])
-        loss_history = self.training_data.get('loss_history', [])
         final_metrics = self.training_data.get('final_metrics', {})
-        
-        # ✅ NEW: Extract enhanced trading metrics
-        trading_metrics = self.training_data.get('trading_metrics', [])
-        portfolio_performance = self.training_data.get('portfolio_performance', [])
+
+        # ✅ NEW: Use simplified broker step history
+        broker_history = self.training_data.get('broker_step_history', [])
         evaluation_rewards = self.training_data.get('evaluation_rewards', [])
 
         analysis = {
@@ -112,15 +92,14 @@ class ModelTrainingReport:
                 'total_evaluations': final_metrics.get('total_evaluations', 0)
             },
             'performance_metrics': self._analyze_ppo_metrics(step_metrics, final_metrics),
-            'loss_trends': self._analyze_loss_trends(loss_history, step_metrics),
             'training_stability': self._assess_training_stability(step_metrics),
-            
-            # ✅ NEW: Enhanced trading performance analysis
-            'trading_performance': self._analyze_trading_performance(trading_metrics, portfolio_performance),
-            'evaluation_progress': self._analyze_evaluation_progress(evaluation_rewards, trading_metrics),
-            'portfolio_analysis': self._analyze_portfolio_performance(portfolio_performance),
-            
-            'recommendations': self._generate_recommendations(step_metrics, final_metrics, trading_metrics)
+
+            # ✅ NEW: Simplified broker-based analysis
+            'broker_performance': self._analyze_broker_step_history(broker_history),
+            'evaluation_progress': self._analyze_evaluation_rewards(evaluation_rewards),
+            'trading_charts_data': self._prepare_trading_charts_data(broker_history),
+
+            'recommendations': self._generate_recommendations(step_metrics, final_metrics, broker_history)
         }
 
         return analysis
@@ -250,7 +229,12 @@ class ModelTrainingReport:
             'final_metrics': old_data.get('final_metrics', {})
         }
 
-    def _generate_recommendations(self, step_metrics: List[Dict], final_metrics: Dict, trading_metrics: Optional[List[Dict]] = None) -> List[str]:
+    def _generate_recommendations(
+        self,
+        step_metrics: List[Dict],
+        final_metrics: Dict,
+        trading_metrics: Optional[List[Dict]] = None
+    ) -> List[str]:
         """Generate training improvement recommendations"""
         recommendations = []
         final_perf = final_metrics.get('performance', {})
@@ -304,7 +288,7 @@ class ModelTrainingReport:
         metrics = analysis.get('performance_metrics', {})
         stability = analysis.get('training_stability', {})
         recommendations = analysis.get('recommendations', [])
-        
+
         # ✅ NEW: Extract trading performance data
         trading_perf = analysis.get('trading_performance', {})
         eval_progress = analysis.get('evaluation_progress', {})
@@ -359,11 +343,11 @@ class ModelTrainingReport:
             print(f"Final Reward: {eval_progress.get('final_reward', 0):.4f}")
             print(f"Best Reward: {eval_progress.get('best_reward', 0):.4f}")
             print(f"Improvement: {eval_progress.get('improvement', 0):+.4f}")
-            
+
             if 'pnl_trend' in eval_progress:
                 pnl_trend = eval_progress['pnl_trend']
                 print(f"PnL Progress: ${pnl_trend.get('initial_pnl', 0):+.2f} → ${pnl_trend.get('final_pnl', 0):+.2f}")
-                
+
             if 'win_rate_trend' in eval_progress:
                 wr_trend = eval_progress['win_rate_trend']
                 print(f"Win Rate Progress: {wr_trend.get('initial_win_rate', 0):.1f}% → {wr_trend.get('final_win_rate', 0):.1f}%")
@@ -373,10 +357,14 @@ class ModelTrainingReport:
             print("\n📊 PORTFOLIO ANALYSIS")
             print("=" * 25)
             print(f"Avg Portfolio Value: ${portfolio_analysis.get('avg_portfolio_value', 0):,.2f}")
-            print(f"Portfolio Range: ${portfolio_analysis.get('min_portfolio_value', 0):,.2f} - ${portfolio_analysis.get('max_portfolio_value', 0):,.2f}")
+            print(
+                f"Portfolio Range: ${portfolio_analysis.get('min_portfolio_value', 0):,.2f} - "
+                f"${portfolio_analysis.get('max_portfolio_value', 0):,.2f}")
             print(f"Portfolio Volatility: ${portfolio_analysis.get('portfolio_volatility', 0):,.2f}")
             print(f"Avg Return: {portfolio_analysis.get('avg_return_pct', 0):+.2f}%")
-            print(f"Return Range: {portfolio_analysis.get('min_return_pct', 0):+.2f}% - {portfolio_analysis.get('max_return_pct', 0):+.2f}%")
+            print(
+                f"Return Range: {portfolio_analysis.get('min_return_pct', 0):+.2f}% - "
+                f"{portfolio_analysis.get('max_return_pct', 0):+.2f}%")
 
         print("\n�🔍 TRAINING STABILITY")
         print("=" * 25)
@@ -549,128 +537,210 @@ class ModelTrainingReport:
         print("⚠️ create_session_summary() is deprecated, use show_training_report() instead")
         return self.show_training_report()
 
-    # ✅ NEW: Enhanced trading analysis methods
-    def _analyze_trading_performance(self, trading_metrics: List[Dict], portfolio_performance: List[Dict]) -> Dict:
-        """Analyze trading performance from enhanced environment data"""
-        if not trading_metrics:
+    # ✅ NEW: Simplified broker-based analysis methods
+    def _analyze_broker_step_history(self, broker_history: List[Dict]) -> Dict:
+        """Analyze broker performance from step history"""
+        if not broker_history:
             return {'status': 'no_data'}
 
-        # Extract key trading metrics
-        final_metrics = trading_metrics[-1] if trading_metrics else {}
-        
-        # Calculate averages across evaluations
-        avg_trades_per_episode = sum(m.get('total_trades_per_episode', 0) for m in trading_metrics) / len(trading_metrics)
-        avg_win_rate = sum(m.get('win_rate_pct', 0) for m in trading_metrics) / len(trading_metrics)
-        avg_pnl = sum(m.get('avg_total_pnl', 0) for m in trading_metrics) / len(trading_metrics)
-        max_exposure = max(m.get('max_position_exposure', 0) for m in trading_metrics)
+        # Extract key metrics from step history
+        total_steps = len(broker_history)
+        trade_steps = [step for step in broker_history if step.get('trade_occurred')]
+
+        # Calculate trading statistics
+        total_trades = len(trade_steps)
+        trade_frequency = total_trades / total_steps if total_steps > 0 else 0
+
+        # Portfolio progression
+        portfolio_values = [step.get('portfolio_value', 0) for step in broker_history]
+        initial_portfolio = portfolio_values[0] if portfolio_values else 0
+        final_portfolio = portfolio_values[-1] if portfolio_values else 0
+
+        # Position analysis
+        position_sizes = [abs(step.get('position_shares', 0)) for step in broker_history]
+        max_position = max(position_sizes) if position_sizes else 0
+
+        # P&L analysis
+        step_pnls = [step.get('step_pnl', 0) for step in broker_history]
+        positive_pnl_steps = len([pnl for pnl in step_pnls if pnl > 0])
+        win_rate = positive_pnl_steps / len(step_pnls) if step_pnls else 0
 
         return {
-            'avg_trades_per_episode': avg_trades_per_episode,
-            'avg_win_rate_pct': avg_win_rate,
-            'avg_pnl_per_episode': avg_pnl,
-            'max_position_exposure': max_exposure,
-            'final_portfolio_value': final_metrics.get('avg_portfolio_value', 0),
-            'total_evaluations': len(trading_metrics),
-            'trading_activity': 'active' if avg_trades_per_episode > 0.1 else 'passive'
+            'total_steps': total_steps,
+            'total_trades': total_trades,
+            'trade_frequency': trade_frequency,
+            'initial_portfolio': initial_portfolio,
+            'final_portfolio': final_portfolio,
+            'portfolio_return': ((final_portfolio - initial_portfolio) / initial_portfolio * 100) if initial_portfolio > 0 else 0,
+            'max_position_size': max_position,
+            'win_rate_pct': win_rate * 100,
+            'avg_step_pnl': sum(step_pnls) / len(step_pnls) if step_pnls else 0,
+            'profitable_steps': positive_pnl_steps,
+            'status': 'analyzed'
         }
 
-    def _analyze_evaluation_progress(self, evaluation_rewards: List[Dict], trading_metrics: List[Dict]) -> Dict:
-        """Analyze progression of evaluation rewards and trading performance"""
+    def _analyze_evaluation_rewards(self, evaluation_rewards: List[Dict]) -> Dict:
+        """Analyze evaluation reward progression"""
         if not evaluation_rewards:
             return {'status': 'no_data'}
 
         rewards = [r.get('mean_reward', 0) for r in evaluation_rewards]
-        
-        progress = {
+
+        return {
             'initial_reward': rewards[0] if rewards else 0,
             'final_reward': rewards[-1] if rewards else 0,
             'best_reward': max(rewards) if rewards else 0,
             'worst_reward': min(rewards) if rewards else 0,
             'total_evaluations': len(rewards),
-            'improvement': (rewards[-1] - rewards[0]) if len(rewards) > 1 else 0
+            'improvement': (rewards[-1] - rewards[0]) if len(rewards) > 1 else 0,
+            'reward_trend': 'improving' if len(rewards) > 1 and rewards[-1] > rewards[0] else 'declining' if len(rewards) > 1 else 'stable',
+            'status': 'analyzed'
         }
 
-        # Add trading performance trend if available
-        if trading_metrics:
-            pnl_values = [t.get('avg_total_pnl', 0) for t in trading_metrics]
-            win_rates = [t.get('win_rate_pct', 0) for t in trading_metrics]
-            
-            progress['pnl_trend'] = {
-                'initial_pnl': pnl_values[0] if pnl_values else 0,
-                'final_pnl': pnl_values[-1] if pnl_values else 0,
-                'best_pnl': max(pnl_values) if pnl_values else 0
-            }
-            
-            progress['win_rate_trend'] = {
-                'initial_win_rate': win_rates[0] if win_rates else 0,
-                'final_win_rate': win_rates[-1] if win_rates else 0,
-                'best_win_rate': max(win_rates) if win_rates else 0
-            }
-
-        return progress
-
-    def _analyze_portfolio_performance(self, portfolio_performance: List[Dict]) -> Dict:
-        """Analyze portfolio performance across evaluations"""
-        if not portfolio_performance:
+    def _prepare_trading_charts_data(self, broker_history: List[Dict]) -> Dict:
+        """Prepare data for direct line chart visualization"""
+        if not broker_history:
             return {'status': 'no_data'}
 
-        all_portfolio_values = []
-        all_pnl_values = []
-        all_return_pct_values = []
+        # Extract time series data for charts
+        steps = [step.get('step', i) for i, step in enumerate(broker_history)]
+        prices = [step.get('price', 0) for step in broker_history]
+        portfolio_values = [step.get('portfolio_value', 0) for step in broker_history]
+        position_shares = [step.get('position_shares', 0) for step in broker_history]
+        balances = [step.get('balance', 0) for step in broker_history]
+        step_pnls = [step.get('step_pnl', 0) for step in broker_history]
+        unrealized_pnls = [step.get('unrealized_pnl', 0) for step in broker_history]
 
-        for perf in portfolio_performance:
-            all_portfolio_values.extend(perf.get('portfolio_values', []))
-            all_pnl_values.extend(perf.get('total_pnl_values', []))
-            all_return_pct_values.extend(perf.get('return_pct_values', []))
+        # Trade markers (for scatter overlay)
+        trade_steps = [step.get('step', i) for i, step in enumerate(broker_history) if step.get('trade_occurred')]
+        trade_prices = [step.get('price', 0) for step in broker_history if step.get('trade_occurred')]
+        trade_signals = [step.get('signal', 0) for step in broker_history if step.get('trade_occurred')]
 
-        if not all_portfolio_values:
-            return {'status': 'no_portfolio_data'}
-
-        # Calculate statistics
-        import numpy as np
-        
         return {
-            'avg_portfolio_value': float(np.mean(all_portfolio_values)),
-            'max_portfolio_value': float(np.max(all_portfolio_values)),
-            'min_portfolio_value': float(np.min(all_portfolio_values)),
-            'portfolio_volatility': float(np.std(all_portfolio_values)),
-            'avg_pnl': float(np.mean(all_pnl_values)) if all_pnl_values else 0,
-            'avg_return_pct': float(np.mean(all_return_pct_values)) if all_return_pct_values else 0,
-            'max_return_pct': float(np.max(all_return_pct_values)) if all_return_pct_values else 0,
-            'min_return_pct': float(np.min(all_return_pct_values)) if all_return_pct_values else 0,
-            'episodes_analyzed': len(portfolio_performance)
+            'time_series': {
+                'steps': steps,
+                'prices': prices,
+                'portfolio_values': portfolio_values,
+                'position_shares': position_shares,
+                'balances': balances,
+                'step_pnls': step_pnls,
+                'unrealized_pnls': unrealized_pnls,
+            },
+            'trade_markers': {
+                'steps': trade_steps,
+                'prices': trade_prices,
+                'signals': trade_signals
+            },
+            'total_data_points': len(broker_history),
+            'status': 'ready_for_charts'
         }
 
-    def _add_trading_recommendations(self, recommendations: List[str], trading_metrics: List[Dict]) -> None:
-        """Add trading-specific recommendations"""
-        if not trading_metrics:
+    def _analyze_trading_performance(self, broker_history: List[Dict]) -> Dict:
+        """Analyze trading performance from broker step history"""
+        if not broker_history:
+            return {'status': 'no_trading_data'}
+
+        # Use the broker step history analysis
+        return self._analyze_broker_step_history(broker_history)
+
+    def _analyze_evaluation_progress(self, evaluation_rewards: List[Dict], broker_history: List[Dict]) -> Dict:
+        """Analyze progression of evaluation rewards and trading performance"""
+        if not evaluation_rewards:
+            return {'status': 'no_data'}
+
+        # Use the specific evaluation rewards analysis
+        rewards_analysis = self._analyze_evaluation_rewards(evaluation_rewards)
+
+        # Add broker trading trends if available
+        if broker_history:
+            broker_analysis = self._analyze_broker_step_history(broker_history)
+            rewards_analysis['broker_trends'] = {
+                'portfolio_return': broker_analysis.get('portfolio_return', 0),
+                'win_rate': broker_analysis.get('win_rate_pct', 0),
+                'trade_frequency': broker_analysis.get('trade_frequency', 0)
+            }
+
+        return rewards_analysis
+
+    def _analyze_portfolio_performance(self, broker_history: List[Dict]) -> Dict:
+        """Analyze portfolio performance from broker step history"""
+        if not broker_history:
+            return {'status': 'no_data'}
+
+        # Extract portfolio values from broker history
+        portfolio_values = [step.get('portfolio_value', 0) for step in broker_history]
+        step_pnls = [step.get('step_pnl', 0) for step in broker_history]
+
+        if not portfolio_values:
+            return {'status': 'no_portfolio_data'}
+
+        # Calculate statistics using numpy
+        import numpy as np
+
+        return {
+            'status': 'analyzed',
+            'avg_portfolio_value': float(np.mean(portfolio_values)),
+            'max_portfolio_value': float(np.max(portfolio_values)),
+            'min_portfolio_value': float(np.min(portfolio_values)),
+            'portfolio_volatility': float(np.std(portfolio_values)),
+            'avg_step_pnl': float(np.mean(step_pnls)) if step_pnls else 0,
+            'total_portfolio_return': (
+                (portfolio_values[-1] - portfolio_values[0]) / portfolio_values[0] * 100
+            ) if portfolio_values[0] > 0 else 0,
+            'max_drawdown': self._calculate_max_drawdown(portfolio_values),
+            'steps_analyzed': len(broker_history)
+        }
+
+    def _calculate_max_drawdown(self, portfolio_values: List[float]) -> float:
+        """Calculate maximum drawdown from portfolio values"""
+        if not portfolio_values:
+            return 0.0
+
+        peak = portfolio_values[0]
+        max_drawdown = 0.0
+
+        for value in portfolio_values:
+            if value > peak:
+                peak = value
+            drawdown = (peak - value) / peak * 100 if peak > 0 else 0
+            max_drawdown = max(max_drawdown, drawdown)
+
+        return max_drawdown
+
+    def _add_trading_recommendations(self, recommendations: List[str], broker_history: List[Dict]) -> None:
+        """Add trading-specific recommendations based on broker history"""
+        if not broker_history:
             return
 
-        avg_win_rate = sum(m.get('win_rate_pct', 0) for m in trading_metrics) / len(trading_metrics)
-        avg_trades = sum(m.get('total_trades_per_episode', 0) for m in trading_metrics) / len(trading_metrics)
-        
+        broker_analysis = self._analyze_broker_step_history(broker_history)
+        win_rate = broker_analysis.get('win_rate_pct', 0)
+        trade_frequency = broker_analysis.get('trade_frequency', 0)
+        portfolio_return = broker_analysis.get('portfolio_return', 0)
+
         # Win rate analysis
-        if avg_win_rate > 60:
+        if win_rate > 60:
             recommendations.append("🎯 Excellent win rate (>60%) - trading strategy is effective")
-        elif avg_win_rate > 45:
+        elif win_rate > 45:
             recommendations.append("📊 Good win rate (45-60%) - strategy shows promise")
-        elif avg_win_rate > 30:
+        elif win_rate > 30:
             recommendations.append("⚠️ Low win rate (30-45%) - consider strategy refinement")
         else:
             recommendations.append("❌ Very low win rate (<30%) - major strategy revision needed")
 
         # Trading frequency analysis
-        if avg_trades < 0.1:
+        if trade_frequency < 0.01:
             recommendations.append("📈 Very low trading frequency - model may be too conservative")
-        elif avg_trades > 5:
+        elif trade_frequency > 0.5:
             recommendations.append("⚠️ High trading frequency - check for overtrading")
         else:
             recommendations.append("✅ Balanced trading frequency")
 
-        # Portfolio performance trend
-        if len(trading_metrics) > 1:
-            pnl_trend = trading_metrics[-1].get('avg_total_pnl', 0) - trading_metrics[0].get('avg_total_pnl', 0)
-            if pnl_trend > 0:
-                recommendations.append("📈 Positive PnL trend - model improving over training")
-            else:
-                recommendations.append("📉 Declining PnL trend - may need training adjustments")
+        # Portfolio performance
+        if portfolio_return > 5:
+            recommendations.append("📈 Strong portfolio returns - strategy is profitable")
+        elif portfolio_return > 0:
+            recommendations.append("� Positive returns - strategy is working")
+        elif portfolio_return > -5:
+            recommendations.append("⚠️ Small losses - minor adjustments needed")
+        else:
+            recommendations.append("❌ Significant losses - major strategy revision required")

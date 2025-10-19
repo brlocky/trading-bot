@@ -1,314 +1,222 @@
 """
-Trading Environment for Reinforcement Learning
-
-Standalone trading environment that can be used with any RL framework.
-Uses separate normalization layer for proper data handling.
+Clean Trading Environment for Reinforcement Learning
+Uses Broker class for all trading operations
 """
 
+import gymnasium as gym
 import numpy as np
 import pandas as pd
-import gymnasium as gym
 from gymnasium import spaces
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 
 from data_processing.feature_normalizer import FeatureNormalizer
+from .broker import TradingBroker
 
 
 class TradingEnvironment(gym.Env):
-    """
-    Trading environment for RL agent with proper normalization separation
-
-    State: window of normalized features + account info
-    Action: [-1, 1] position size (short/flat/long)
-    Reward: PnL change minus drawdown penalty
-    """
+    """Clean trading environment using Broker for trading operations"""
 
     def __init__(self,
                  df: pd.DataFrame,
+                 normalizer: FeatureNormalizer,
                  feature_config: Dict[str, str],
                  initial_balance: float = 1000000.0,
                  window_size: int = 672,
-                 fit_normalizer: bool = True):
-        """
-        Initialize trading environment with dual action space:
-        - Action[0]: Signal [-1, 1] (sell/hold/buy)  
-        - Action[1]: Position Size [0, 1] (fraction of account)
+                 buy_threshold: float = 0.1,
+                 sell_threshold: float = -0.1):
 
-        Args:
-            df: DataFrame with OHLCV data and features
-            feature_config: Dict mapping feature names to normalization types
-            initial_balance: Starting balance
-            window_size: Observation window size
-            fit_normalizer: Whether to fit normalizer to this data (False for test sets)
-        """
         super().__init__()
 
-        # Store parameters
-        self.initial_balance = initial_balance
-        self.window_size = window_size
-
-        # Store original data
-        self.df = df.copy()
-
-        # Store Feature configuration
+        # Core parameters
+        self.df = df.copy().reset_index(drop=True)
+        self.normalizer = normalizer
         self.feature_config = feature_config
         self.feature_columns = list(feature_config.keys())
+        self.window_size = window_size
+        self.buy_threshold = buy_threshold
+        self.sell_threshold = sell_threshold
 
-        # Validate features exist in dataframe
+        # Validate DataFrame
         missing_features = set(self.feature_columns) - set(self.df.columns)
         if missing_features:
-            raise ValueError(f"Missing features in DataFrame: {missing_features}")
+            raise ValueError(f"Missing features: {missing_features}")
 
-        # Configure action and observation spaces
+        # Initialize broker
+        self.broker = TradingBroker(initial_balance)
+
+        # Environment state
+        self.current_step = window_size
+
+        # Prepare data
+        self._prepare_data()
+
+        # Define spaces
         self.action_space = spaces.Box(
-            low=np.array([-1.0, 0.001]),   # [signal_min, position_size_min]
-            high=np.array([1.0, 1.0]),     # [signal_max, position_size_max]
-            shape=(2,),                    # Two outputs
+            low=np.array([-1.0, 0.0]),
+            high=np.array([1.0, 1.0]),
+            shape=(2,),
             dtype=np.float32
         )
 
-        # Features + [Balance Change, Position, Last Signal, Last Position Size, Total Return %, Unrealized PnL, Position Exposure, Step PnL]
-        obs_dim = len(self.feature_columns) + 8
+        obs_dim = len(self.feature_columns) + 10  # Features + account info
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(self.window_size, obs_dim),
+            shape=(window_size, obs_dim),
             dtype=np.float32
         )
 
-        try:
-            # Setup normalization
-            self._setup_normalizer(fit_normalizer)
-
-            # Normalize the data
-            self._prepare_normalized_data()
-
-            # Initialize environment state
-            self.reset()
-        except Exception as e:
-            print(f"Error during environment initialization: {e}")
-            raise e
-
-    def _setup_normalizer(self, fit_normalizer: bool):
-        # Create new normalizer
-        self.normalizer = FeatureNormalizer(self.feature_config)
-
-        if fit_normalizer:
-            print("🔧 Fitting new normalizer to training data...")
-            self.normalizer.fit(self.df[self.feature_columns], close_prices=self.df['close'])
-        else:
-            raise ValueError("Cannot create unfitted normalizer without fit_normalizer=True")
-
-    def _prepare_normalized_data(self):
-        """Pre-normalize all features for efficient observation retrieval"""
+    def _prepare_data(self):
+        """Prepare normalized data"""
         print("⚡ Pre-normalizing feature data...")
-
-        # Normalize features
         normalized_features = self.normalizer.transform(
             self.df[self.feature_columns],
             close_prices=self.df['close']
         )
-
-        # Store normalized features as numpy array for fast access
         self.normalized_features = normalized_features[self.feature_columns].values
-
         print(f"✅ Pre-normalized {len(self.feature_columns)} features")
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
-        """Reset with dual action tracking"""
+        """Reset environment and broker"""
+        super().reset(seed=seed)
+
         self.current_step = self.window_size
-        self.balance = self.initial_balance
-        self.position = 0.0
-        self.entry_price = 0.0
-        self.done = False
-
-        # Initialize dual action tracking
-        self.last_signal = 0.0
-        self.last_position_size = 0.0
-
-        # Initialize tracking metrics
-        self.step_pnl = 0.0
-        self.unrealized_pnl = 0.0
-        self.position_exposure = 0.0
-
-        if seed is not None:
-            np.random.seed(seed)
+        self.broker.reset()
 
         return self._get_obs(), {}
 
-    def _get_obs(self):
-        """Updated observation with dual action feedback"""
-        # Get the window of normalized features
-        start_idx = self.current_step - self.window_size
-        end_idx = self.current_step
-
-        feature_window = self.normalized_features[start_idx:end_idx]
-
-        # Enhanced account info with dual action history
-        account_info = np.array([
-            (self.balance / self.initial_balance - 1.0),  # Balance change
-            np.tanh(self.position),                       # Current position
-            getattr(self, 'last_signal', 0.0),          # Previous signal [-1, 1]
-            getattr(self, 'last_position_size', 0.0),   # Previous position size [0, 1]
-
-            # Trading metrics (same as before)
-            ((self.balance / self.initial_balance) - 1) * 100,  # Total return %
-            self.unrealized_pnl / self.initial_balance,          # Normalized unrealized PnL
-            self.position_exposure / self.initial_balance,       # Normalized position exposure
-            self.step_pnl / self.initial_balance                 # Normalized step PnL
-        ])
-
-        # Broadcast account info to match window size
-        account_window = np.tile(account_info, (self.window_size, 1))
-
-        # Concatenate features and account info
-        obs = np.concatenate([feature_window, account_window], axis=1)
-
-        # Final safety check for NaN values
-        obs = np.nan_to_num(obs, nan=0.0, posinf=3.0, neginf=-3.0)
-
-        return obs.astype(np.float32)
-
     def step(self, action):
-        """Execute one step with additive position management"""
-        if self.done:
-            return self._get_obs(), 0.0, True, False, {}
+        """Execute one step using broker"""
+        # Decode action
+        raw_signal, raw_position_size = action
+        signal, position_size = self._decode_action(raw_signal, raw_position_size)
 
-        # Store previous state
-        prev_balance = self.balance
-        prev_position = self.position
+        # Get current price
+        current_price = self.df['close'][self.current_step]
 
-        # Parse dual actions
-        signal = float(action[0])      # [-1, 1]: sell/hold/buy direction
-        position_size = float(action[1])  # [0.001, 1]: fraction of account
-        price = self.df.iloc[self.current_step]['close']
+        # Execute trade through broker
+        step_pnl, trade_occurred, is_bankrupt = self.broker.step(
+            signal, position_size, current_price, self.current_step
+        )
 
-        # Store actions for next observation
-        self.last_signal = signal
-        self.last_position_size = position_size
+        # Check termination conditions - STOP training on bankruptcy
+        terminated = is_bankrupt
+        truncated = self.current_step >= len(self.df) - 1
 
-        # Apply thresholds to filter out weak signals
-        buy_threshold = 0.1
-        sell_threshold = -0.1
-
-        # Calculate target position (not replacement position)
-        target_position = 0.0
-        if signal > buy_threshold:
-            # LONG: Target position size
-            target_position = position_size  # e.g., 0.8 = 80% of account
-        elif signal < sell_threshold:
-            # SHORT: Target negative position
-            target_position = -position_size  # e.g., -0.3 = 30% short
+        # Calculate reward - let positive PnL guide learning
+        if terminated:
+            # End episode on bankruptcy with neutral reward
+            reward = 0.0
         else:
-            # HOLD: Target zero position
-            target_position = 0.0
-
-        # Calculate position change (incremental trade)
-        position_change = target_position - self.position
-
-        # Calculate reward and trade metrics
-        reward = 0.0
-        step_pnl = 0.0
-        trade_occurred = abs(position_change) > 0.001  # Small threshold for precision
-
-        # Execute the position change
-        if trade_occurred:
-            # Close/adjust existing position if needed
-            if self.position != 0:
-                # PnL from existing position
-                existing_pnl = (price - self.entry_price) * self.position
-                self.balance += existing_pnl
-                step_pnl += existing_pnl
-
-            # Update to target position
-            self.position = target_position
-
-            # Set new entry price for the target position
-            if self.position != 0:
-                self.entry_price = price
-
-            # Calculate reward from the trade
-            reward = step_pnl / self.initial_balance
-
-        # Update tracking metrics
-        self.step_pnl = step_pnl
-        self.unrealized_pnl = 0.0 if self.position == 0 else (price - self.entry_price) * self.position
-        self.position_exposure = abs(self.position) * price
+            # Normal reward calculation based on PnL
+            reward = self._calculate_reward(step_pnl, current_price)
 
         # Move to next step
         self.current_step += 1
-        if self.current_step >= len(self.df):
-            self.done = True
 
-        obs = self._get_obs()
+        # Create info
+        info = self._create_info(signal, position_size, current_price,
+                                 step_pnl,  trade_occurred,
+                                 is_bankrupt)
 
-        # Enhanced info with position change tracking
-        info = {
-            # Core state
-            'balance': self.balance,
-            'position': self.position,
+        return self._get_obs(), reward, terminated, truncated, info
+
+    def _decode_action(self, raw_signal, position_size):
+        """Convert raw action to trading signal"""
+        if raw_signal >= self.buy_threshold:
+            return 1, position_size  # BUY
+        elif raw_signal <= self.sell_threshold:
+            return -1, position_size  # SELL
+        else:
+            return 0, 0.0  # HOLD
+
+    def _calculate_reward(self, step_pnl, current_price):
+        """Simple percentage-based reward - proven to work"""
+
+        total_portfolio = self.broker.balance + self.broker.capital_used
+        initial_balance = self.broker.initial_balance
+
+        # Simple percentage returns (already normalized to 0-1 range)
+        portfolio_pct = (total_portfolio - initial_balance) / initial_balance
+        step_pct = step_pnl / initial_balance
+
+        # Balanced: care about both step and cumulative performance
+        reward = step_pct + 0.1 * portfolio_pct  # Step has 10x more weight than cumulative
+
+        # Clip to safe range
+        return np.clip(reward, -0.5, 0.5)
+
+    def _get_obs(self):
+        """Get observation window - fully vectorized for LSTM"""
+        end_step = self.current_step
+        start_step = end_step - self.window_size + 1
+        steps = np.arange(max(0, start_step), end_step + 1)
+        actual_window_size = len(steps)
+
+        # Clamp feature access
+        batch_features = self.normalized_features[np.clip(steps, 0, len(self.normalized_features) - 1)]
+        current_prices = self.df['close'].iloc[np.clip(steps, 0, len(self.df) - 1)].values
+        initial_balance = self.broker.initial_balance
+
+        # Gather broker states
+        broker_states = []
+        for step, price in zip(steps, current_prices):
+            history_index = step - self.window_size
+            if 0 <= history_index < len(self.broker.step_history):
+                state = self.broker.step_history[history_index]
+            else:
+                state = self.broker.create_step_state(step, price, 0, 0.0, 0.0, False)
+            broker_states.append(state)
+
+        # Vectorized normalization
+        position_size = np.array([s['position_size'] for s in broker_states], dtype=np.float32)
+        signal = np.array([s['signal'] for s in broker_states], dtype=np.float32)
+        position_sign = np.sign(np.array([s['position_shares'] for s in broker_states]))
+        position_shares = np.array([s['position_shares'] for s in broker_states], dtype=np.float32)
+        position_shares_scaled = position_shares / self.broker.quantity_precision
+
+        step_pnl = np.array([s['step_pnl'] for s in broker_states], dtype=np.float32) / initial_balance
+        portfolio_ratio = np.array([s['portfolio_value'] for s in broker_states], dtype=np.float32) / initial_balance
+        capital_available = np.array([s['balance'] for s in broker_states], dtype=np.float32) / initial_balance
+        capital_used = np.array([s['capital_used'] for s in broker_states], dtype=np.float32) / initial_balance
+        total_trades = np.tanh(np.array([s['total_trades'] for s in broker_states]) / 10000.0)
+
+        # Assemble account info
+        account_info = np.stack([
+            signal,
+            position_size,
+            portfolio_ratio,
+            capital_available,
+            position_sign,
+            position_shares_scaled,
+            step_pnl,
+            total_trades,
+            capital_used,
+            np.ones(actual_window_size, dtype=np.float32)  # bias term
+        ], axis=1)
+
+        # Concatenate features + broker info
+        obs_array = np.concatenate([batch_features, account_info], axis=1)
+
+        # Pad at beginning if window < window_size
+        if obs_array.shape[0] < self.window_size:
+            pad_rows = self.window_size - obs_array.shape[0]
+            obs_array = np.vstack([np.zeros((pad_rows, obs_array.shape[1]), dtype=np.float32), obs_array])
+
+        return obs_array.astype(np.float32)
+
+    def _create_info(self, signal, position_size, price, step_pnl, trade_occurred,
+                     is_bankrupt):
+        """Create info dictionary with action validation feedback"""
+        broker_state = self.broker.get_state()
+
+        # Add action validation info
+        return {
+            'signal': signal,
+            'position_size': position_size,
             'price': price,
-            'step': self.current_step,
-
-            # PnL tracking
             'step_pnl': step_pnl,
-            'total_pnl': self.balance - self.initial_balance,
-            'total_return_pct': ((self.balance / self.initial_balance) - 1) * 100,
-            'unrealized_pnl': self.unrealized_pnl,
-
-            # Enhanced position tracking
-            'signal_raw': signal,
-            'position_size_raw': position_size,
-            'target_position': target_position,      # What model wanted
-            'position_change': position_change,      # Actual change made
             'trade_occurred': trade_occurred,
-            'prev_position': prev_position,          # Previous position
-
-            # Portfolio metrics
-            'portfolio_value': self.balance,
-            'reward': reward,
-            'position_exposure': self.position_exposure,
-            'entry_price': self.entry_price,
-            'balance_change': self.balance - prev_balance,
-
-            # Timestamp
-            'timestamp': self.df.iloc[self.current_step-1]['time'] if 'time' in self.df.columns and self.current_step > 0 else None,
+            'is_bankrupt': is_bankrupt,
+            **broker_state  # Include all broker state
         }
-
-        return obs, reward, self.done, False, info
-
-    def get_normalizer(self) -> FeatureNormalizer:
-        """Get the fitted normalizer for use with test environments"""
-        return self.normalizer
-
-    def save_normalizer(self, filepath: str):
-        """Save the fitted normalizer"""
-        self.normalizer.save(filepath)
-
-    def get_feature_stats(self) -> Dict[str, Any]:
-        """Get normalization statistics for inspection"""
-        return self.normalizer.get_feature_stats()
-
-    def validate_data_integrity(self) -> Dict[str, Any]:
-        """Validate data integrity and normalization quality"""
-        stats = {}
-
-        # Check for NaN values in original features
-        nan_counts = self.df[self.feature_columns].isnull().sum()
-        stats['original_nan_counts'] = nan_counts[nan_counts > 0].to_dict()
-
-        # Check normalized feature ranges
-        normalized_stats = {}
-        for i, feature in enumerate(self.feature_columns):
-            feature_data = self.normalized_features[:, i]
-            normalized_stats[feature] = {
-                'min': float(np.min(feature_data)),
-                'max': float(np.max(feature_data)),
-                'mean': float(np.mean(feature_data)),
-                'std': float(np.std(feature_data)),
-                'nan_count': int(np.sum(np.isnan(feature_data)))
-            }
-
-        stats['normalized_features'] = normalized_stats
-
-        return stats

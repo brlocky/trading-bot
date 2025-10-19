@@ -3,6 +3,7 @@ KISS Indicator Utils
 Minimal shared indicator calculation for both MLTrainer and trade generator.
 """
 
+import numpy as np
 import pandas as pd
 import talib
 
@@ -61,12 +62,17 @@ def add_indicators(df: pd.DataFrame, add_crossovers: bool = True) -> pd.DataFram
     df['stochastic_d'] = stoch_d
 
     # === VWAP (reset daily) ===
-    if 'time' not in df.columns:
-        raise ValueError("DataFrame must contain 'time' column with timestamps in milliseconds.")
-    df['vwap'] = (
-        df.assign(date=pd.to_datetime(df['time'], unit='ms').dt.date)
-        .groupby('date', group_keys=False)
-        .apply(lambda x: (x['volume'] * x['close']).cumsum() / x['volume'].cumsum())
-    )
+    # Convert Unix timestamps (seconds) to datetime
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+
+    # Now daily reset works
+    days = df['time'].dt.floor('D')
+
+    # Compute cumulative sums per day
+    cum_vol = df.groupby(days)['volume'].cumsum()
+    cum_vp = (df['volume'] * df['close']).groupby(days).cumsum()
+
+    # Assign VWAP
+    df['vwap'] = cum_vp.values / cum_vol.values
 
     return df

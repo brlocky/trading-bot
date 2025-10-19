@@ -18,7 +18,7 @@ __all__ = [
 
 
 # Module-level convenience functions
-def create_training_report(model_dir: str = 'models/rl_demo') -> ModelTrainingReport:
+def create_training_report(model_dir: str = 'models/rl_stable_v1') -> ModelTrainingReport:
     """
     Create a ModelTrainingReport instance for RL training analysis.
 

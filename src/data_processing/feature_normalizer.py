@@ -7,7 +7,7 @@ and prevents data leakage during training/testing splits.
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Tuple, Optional, Any, List
+from typing import Dict, Tuple, Optional, List
 import pickle
 import os
 from abc import ABC, abstractmethod
@@ -38,14 +38,18 @@ class BaseNormalizer(ABC):
 class PriceRatioNormalizer(BaseNormalizer):
     """Convert prices to percentage change relative to close price"""
 
-    def fit(self, data: np.ndarray, close_prices: np.ndarray) -> 'PriceRatioNormalizer':
+    def fit(self, data: np.ndarray, **kwargs) -> 'PriceRatioNormalizer':
         # No fitting required for this normalizer
         self.is_fitted = True
         return self
 
-    def transform(self, data: np.ndarray, close_prices: np.ndarray) -> np.ndarray:
+    def transform(self, data: np.ndarray, **kwargs) -> np.ndarray:
         if not self.is_fitted:
             raise ValueError("Normalizer must be fitted before transform")
+
+        close_prices = kwargs.get('close_prices')
+        if close_prices is None:
+            raise ValueError("close_prices required for price_ratio normalization")
 
         with np.errstate(divide='ignore', invalid='ignore'):
             ratios = (data / close_prices) - 1.0
@@ -148,9 +152,12 @@ class VolumeLogNormalizer(BaseNormalizer):
 
         # Replace NaN with 1 (so log(1+1) = log(2), then standardized)
         filled_data = np.where(np.isnan(data), 1.0, data)
-
-        log_data = np.log(filled_data + 1)
-        return (log_data - self.stats['mean']) / self.stats['std']
+        try:
+            log_data = np.log(filled_data + 1)
+            return (log_data - self.stats['mean']) / self.stats['std']
+        except Exception as e:
+            print(f"Error in VolumeLogNormalizer transform: {e}")
+            return np.zeros_like(data)
 
 
 class IdentityNormalizer(BaseNormalizer):
@@ -269,9 +276,14 @@ class FeatureNormalizer:
                 raise ValueError(f"Feature '{feature}' not found in DataFrame, skipping")
 
             normalizer = self.normalizers[feature]
-            feature_data = df[feature].values
-            norm_type = self.config[feature]
 
+            # Standardize feature data
+            feature_data = df[feature].copy()
+
+            # Forward-fill and back-fill NaNs to avoid issues during normalization
+            feature_data = feature_data.ffill().bfill().to_numpy()
+
+            norm_type = self.config[feature]
             if norm_type == 'price_ratio':
                 if close_prices is None:
                     raise ValueError("close_prices required for price_ratio normalization")
@@ -282,8 +294,6 @@ class FeatureNormalizer:
             else:
                 normalized = normalizer.transform(feature_data)
 
-            # Handle NaN values
-            normalized = np.nan_to_num(normalized, nan=0.0, posinf=3.0, neginf=-3.0)
             result[feature] = normalized
 
         return result
@@ -297,11 +307,13 @@ class FeatureNormalizer:
         if not self.is_fitted:
             raise ValueError("Cannot save unfitted normalizer")
 
+        # Only save essential data: config + normalizer stats
         save_data = {
             'config': self.config,
-            'normalizers': self.normalizers,
-            'feature_columns': self.feature_columns,
-            'is_fitted': self.is_fitted
+            'normalizer_stats': {
+                feature: normalizer.stats
+                for feature, normalizer in self.normalizers.items()
+            }
         }
 
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -316,31 +328,18 @@ class FeatureNormalizer:
         with open(filepath, 'rb') as f:
             save_data = pickle.load(f)
 
+        # Recreate normalizer from config
         normalizer = cls(save_data['config'])
-        normalizer.normalizers = save_data['normalizers']
-        normalizer.feature_columns = save_data['feature_columns']
-        normalizer.is_fitted = save_data['is_fitted']
+
+        # Rebuild normalizers and restore their stats
+        for feature, norm_type in save_data['config'].items():
+            new_normalizer = normalizer.normalizer_factory[norm_type]()
+            new_normalizer.stats = save_data['normalizer_stats'].get(feature, {})
+            new_normalizer.is_fitted = True
+            normalizer.normalizers[feature] = new_normalizer
+
+        normalizer.feature_columns = list(save_data['config'].keys())
+        normalizer.is_fitted = True
 
         print(f"📥 Loaded normalizer from {filepath}")
         return normalizer
-
-    def get_feature_stats(self) -> Dict[str, Dict[str, Any]]:
-        """Get normalization statistics for inspection"""
-        if not self.is_fitted:
-            raise ValueError("Normalizer must be fitted to get stats")
-
-        stats = {}
-        for feature, normalizer in self.normalizers.items():
-            stats[feature] = {
-                'type': self.config[feature],
-                'stats': getattr(normalizer, 'stats', {}),
-                'is_fitted': normalizer.is_fitted
-            }
-
-        return stats
-
-
-# Convenience function for RL integration
-def create_rl_normalizer(config_dict: Dict[str, str]) -> FeatureNormalizer:
-    """Create feature normalizer configured for RL trading"""
-    return FeatureNormalizer(config_dict)

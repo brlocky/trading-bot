@@ -8,23 +8,44 @@ without depending on config files or external dependencies.
 from typing import Dict, List
 
 
-def get_default_feature_normalization() -> Dict[str, str]:
-    """
-    Get default feature normalization configuration.
-    Maps feature names to normalizer types based on actual production features.
-    """
+def get_features_config() -> Dict[str, List[str]]:
     return {
-        # === BASE FEATURES ===
-        # OHLCV
+        '15m': [
+            'ema20', 'ema200', 'vwap', 'bb_position',
+            'rsi',  'macd', 'macd_hist', 'volume_ma20', 'volume_ratio', 'volatility',
+            'ema9_ema21_cross', 'ema20_ema50_cross'
+        ],
+        '1h': [
+            'ema20', 'ema50', 'ema200', 'rsi', 'macd', 'macd_hist'
+        ],
+        'D': [
+            'ema200', 'macd', 'macd_hist', 'rsi'
+        ],
+        'W': [
+            'ema50', 'macd', 'macd_hist', 'rsi'
+        ]
+    }
+
+
+def get_features_list() -> Dict[str, str]:
+    """
+    Get the complete mapping of features to their normalizers.
+    Combines base OHLCV features with timeframe indicators.
+    """
+    # Feature type to normalizer mapping
+    feature_normalizers = {
+        # Base OHLCV
         'open': 'price_ratio',
         'high': 'price_ratio',
         'low': 'price_ratio',
         'close': 'price_baseline',
         'volume': 'volume_log',
 
-        # === 15M TECHNICAL INDICATORS ===
-        'ema20': 'price_ratio',
+        # Technical indicators from all features (including commented ones)
+        'ema9': 'price_ratio',
+        'ema21': 'price_ratio',
         'ema50': 'price_ratio',
+        'ema20': 'price_ratio',
         'ema200': 'price_ratio',
         'vwap': 'price_ratio',
         'bb_upper': 'price_ratio',
@@ -36,99 +57,94 @@ def get_default_feature_normalization() -> Dict[str, str]:
         'volume_ma20': 'volume_log',
         'volume_ratio': 'ratio',
         'volatility': 'standard',
-        'ema9_ema21_cross': 'bounded_0_1',  # binary 0/1 mapped to [-1,+1]
-        'ema20_ema50_cross': 'bounded_0_1',  # binary 0/1 mapped to [-1,+1]
-
-        # === INTERPOLATED 1H FEATURES ===
-        'ema20_1h': 'price_ratio',
-        'ema50_1h': 'price_ratio',
-        'ema200_1h': 'price_ratio',
-        'rsi_1h': 'bounded_0_100',
-        'macd_1h': 'oscillator',
-        'macd_hist_1h': 'oscillator',
-
-        # === INTERPOLATED DAILY FEATURES ===
-        'ema20_D': 'price_ratio',
-        'ema50_D': 'price_ratio',
-        'macd_hist_D': 'oscillator',
-        'rsi_D': 'bounded_0_100',
-
-        # === INTERPOLATED WEEKLY FEATURES ===
-        'ema20_W': 'price_ratio',
-        'ema50_W': 'price_ratio',
-        'macd_hist_W': 'oscillator',
-        'rsi_W': 'bounded_0_100',
-
-        # === INTERPOLATED MONTHLY FEATURES ===
-        'ema20_M': 'price_ratio',
-        'ema50_M': 'price_ratio',
-        'macd_hist_M': 'oscillator',
-        'rsi_M': 'bounded_0_100',
+        'ema9_ema21_cross': 'bounded_0_1',
+        'ema20_ema50_cross': 'bounded_0_1'
     }
+
+    # Start with base OHLCV features
+    features = {
+        'open': feature_normalizers['open'],
+        'high': feature_normalizers['high'],
+        'low': feature_normalizers['low'],
+        'close': feature_normalizers['close'],
+        'volume': feature_normalizers['volume']
+    }
+
+    # Get timeframe indicators
+    timeframe_indicators = get_features_config()
+
+    # Add 15m indicators directly
+    if '15m' in timeframe_indicators:
+        for indicator in timeframe_indicators['15m']:
+            normalizer = feature_normalizers.get(indicator)
+            if not normalizer:
+                raise ValueError(f"No normalizer found for indicator: {indicator}")
+            features[indicator] = normalizer
+
+    # Add other timeframes with suffix
+    for timeframe, indicators in timeframe_indicators.items():
+        if timeframe != '15m':  # Skip 15m as it's already added
+            for indicator in indicators:
+                feature_name = f"{indicator}_{timeframe}"
+                normalizer = feature_normalizers.get(indicator)
+                if not normalizer:
+                    raise ValueError(f"No normalizer found for indicator: {indicator}")
+                features[feature_name] = normalizer
+
+    return features
 
 
 # Environment configuration helpers
 def get_default_environment_config():
-    """Get default trading environment configuration"""
+    """Get default trading environment configuration optimized for stability"""
     return {
-        'initial_balance': 1000000.0,
-        'window_size': 672,
+        'initial_balance': 1000.0,
+        'buy_threshold': 0.05,         # 🛡️ STABLE: 0.3 → 0.5 (more conservative thresholds)
+        'sell_threshold': -0.05,       # 🛡️ STABLE: -0.3 → -0.5 (more conservative thresholds)
     }
 
 
-def get_training_config():
-    """Get default training configuration matching rl_config.ini"""
+def get_model_config():
+    """Get training configuration for RecurrentPPO - FIXED VALUE FUNCTION"""
     return {
         # PPO training configuration
-        'total_timesteps': 10000,  # Keep current training length
-        'early_stop_patience': 8,  # Increased patience for slower learning
-        'early_stop_threshold': 0.01,
-        'eval_freq': 1000,  # Less frequent evaluation
-        'n_eval_episodes': 10,
+        'total_timesteps': 100000,
+        'n_eval_episodes': 3,
         'train_test_split': 0.8,
 
-        # PPO hyperparameters
-        'learning_rate': 3e-4,
-        'n_steps': 2048,
-        'batch_size_gpu': 64,
+        # Environment configuration
+        'window_size': 336,
+
+        # PPO hyperparameters - DUAL LEARNING RATES
+        'learning_rate': 3e-4,            # 🔧 INCREASED: 3e-5 → 3e-4 (10x higher for VF)
+        'n_steps': 2048,                  # 🔧 INCREASED: 1024 → 2048 (longer rollouts)
+        'batch_size_gpu': 256,            # Keep large batches
         'batch_size_cpu': 128,
-        'n_epochs': 10,
+        'n_epochs': 4,                    # 🔧 REDUCED: Was unstable with 10
         'gamma': 0.99,
         'gae_lambda': 0.95,
         'clip_range': 0.2,
-        'ent_coef': 0.1,
-        'vf_coef': 0.5,
-        'max_grad_norm': 0.5,
+
+        # Additional hyperparameters - VALUE FUNCTION FOCUS
+        'clip_range_vf': None,            # 🔧 DISABLED: Let VF learn freely
         'normalize_advantage': True,
-        'use_sde': True,
-        'sde_sample_freq': 4,
+        'target_kl': None,                # 🔧 DISABLED: We want full learning
+        'stats_window_size': 25,
+        'seed': 42,
+
+        'ent_coef': 0.01,                 # 🔧 REDUCED: 0.02 → 0.01 (less randomness)
+        'vf_coef': 0.5,                   # 🔧 STANDARD: Balanced loss weighting
+        'max_grad_norm': 0.5,
+        'use_sde': False,
+        'sde_sample_freq': -1,
+
+        # Environment configuration
+        'n_envs': 4,                      # 🔧 REDUCED: 8 → 4 (higher quality rollouts)
 
         # Network architecture
-        'hidden_layers_pi': [512, 256, 128],
-        'hidden_layers_vf': [512, 256, 128],
+        'hidden_layers_vf': [256, 256],
+        'hidden_layers_pi': [256, 128],
+        'lstm_hidden_size': 128,
         'activation_function': 'tanh',
-        'ortho_init': False,
-    }
-
-
-def get_timeframe_indicators() -> Dict[str, List[str]]:
-    """Get timeframe indicators configuration matching actual TIMEFRAME_INDICATORS"""
-    return {
-        '15m': [
-            'ema20', 'ema50', 'ema200', 'vwap', 'bb_upper', 'bb_lower',
-            'rsi', 'bb_position', 'macd', 'macd_hist', 'volume_ma20', 'volume_ratio', 'volatility',
-            'ema9_ema21_cross', 'ema20_ema50_cross'
-        ],
-        '1h': [
-            'ema20', 'ema50', 'ema200', 'rsi', 'macd', 'macd_hist'
-        ],
-        'D': [
-            'ema20', 'ema50', 'macd_hist', 'rsi'
-        ],
-        'W': [
-            'ema20', 'ema50', 'macd_hist', 'rsi'
-        ],
-        'M': [
-            'ema20', 'ema50', 'macd_hist', 'rsi'
-        ]
+        'ortho_init': True,
     }

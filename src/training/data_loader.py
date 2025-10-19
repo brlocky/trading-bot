@@ -2,9 +2,8 @@ import json
 from pathlib import Path
 from typing import Dict, List
 import pandas as pd
-from indicator_utils import add_indicators
 from core.trading_types import ChartInterval
-from core.normalization_config import get_default_feature_normalization, get_timeframe_indicators
+from core.normalization_config import get_features_list
 
 
 class DataLoader:
@@ -98,10 +97,6 @@ class DataLoader:
             # Add interpolated values back to target dataframe
             target_df[new_col_name] = merged[indicator].values
 
-            # Count how many values were successfully interpolated
-            valid_count = pd.notna(merged[indicator]).sum()
-            print(f"  ✅ Interpolated {valid_count:,}/{len(target_df):,} values for {new_col_name}")
-
         except Exception as e:
             print(f"❌ Error interpolating {source_timeframe} → {target_tf}: {e}")
             # Add column with NaN values as fallback
@@ -122,15 +117,11 @@ class DataLoader:
             candle_files = self._build_candle_file_config(symbol, timeframes)
             dfs = self._load_files(candle_files)
 
-            # Step 2: Calculate timeframe-specific indicators
-            print("🔧 Adding timeframe-specific technical indicators...")
-            for tf, df in dfs.items():
-                add_indicators(df)
-
-            # Step 3: Load and merge levels cache with target timeframe
+            # Step 2: Validate target timeframe
             if target_tf not in dfs:
                 raise ValueError(f"Target timeframe '{target_tf}' not found in loaded dataframes")
 
+            # Step 3: Load precomputed levels from Parquet
             levels_df = self.load_parquet(symbol, target_tf)
 
             # Merge levels with target timeframe candle data
@@ -148,48 +139,57 @@ class DataLoader:
 
             # Step 4: Interpolate higher timeframe indicators to target timeframe
             if len(timeframes) > 1:
-                print(f"🔄 Recalculating higher timeframe indicators for {target_tf}...")
 
-                # Use the complete feature list from configuration
-                features_list = list(get_default_feature_normalization().keys())
-                timeframe_indicators = get_timeframe_indicators()
+                # Get the complete feature configuration
+                features_config = get_features_list()
 
-                for tf in timeframes:
-                    if tf == target_tf:
+                # Extract timeframe-specific features that need interpolation
+                timeframe_features: dict = {}
+                for feature_name in features_config.keys():
+                    # Skip base OHLCV features
+                    if feature_name in ['open', 'high', 'low', 'close', 'volume']:
                         continue
+
+                    # Check if it's a timeframe-specific feature (has suffix like _1h, _D, etc.)
+                    for tf in timeframes:
+                        if tf != target_tf and feature_name.endswith(f'_{tf}'):
+                            # Extract the base indicator name
+                            indicator = feature_name.replace(f'_{tf}', '')
+
+                            if tf not in timeframe_features:
+                                timeframe_features[tf] = []
+                            timeframe_features[tf].append(indicator)
+                            break
+
+                # Interpolate indicators for each timeframe
+                for tf, indicators in timeframe_features.items():
                     if tf not in dfs:
-                        raise ValueError(f"Timeframe '{tf}' not found in loaded dataframes")
+                        print(f"⚠️ Warning: Timeframe '{tf}' not found in loaded dataframes")
+                        continue
 
-                    # Get indicators for this timeframe from configuration
-                    tf_indicators = list(timeframe_indicators.get(tf, set()))
-                    for indicator in tf_indicators:
-                        source_df = dfs[tf]
+                    source_df = dfs[tf]
+
+                    for indicator in indicators:
                         if indicator not in source_df.columns:
-                            raise ValueError(f"Indicator '{indicator}' not found in {tf} dataframe")
-
-                        # Construct target column name
-                        target_col_name = f"{indicator}_{tf}"
-
-                        # Only process if the indicator is in the features list
-                        if target_col_name not in features_list:
+                            print(f"⚠️ Warning: Indicator '{indicator}' not found in {tf} dataframe")
                             continue
 
-                        # Interpolate indicator from tf to target_tf
+                        try:
+                            # Copy only the indicator from the source
+                            source_copy = source_df[[indicator]].copy()
 
-                        # 1. Copy only the indicator from the source
-                        source_copy = source_df[[indicator]].copy()
+                            # Expand to match target index and interpolate
+                            expanded = source_copy.reindex(target_df.index.union(source_copy.index)).sort_index()
+                            expanded[indicator] = expanded[indicator].interpolate(method='time')
 
-                        # 2. Expand to match target index and interpolate
-                        expanded = source_copy.reindex(target_df.index.union(source_copy.index)).sort_index()
-                        expanded[indicator] = expanded[indicator].interpolate(method='time')
+                            # Assign interpolated values to target with proper column name
+                            target_col_name = f"{indicator}_{tf}"
+                            target_df[target_col_name] = expanded.reindex(target_df.index)[indicator]
 
-                        # 3. Assign interpolated values to target
-                        target_df[target_col_name] = expanded.reindex(target_df.index)[indicator]
-
-                        # Copy indicator values to target dataframe (will be re-interpolated later)
-                        """ target_df[target_col_name] = self.recalculate_higher_timeframe_indicator(
-                            source_df=dfs[tf], target_df=target_df, source_timeframe=tf, target_tf=target_tf,  indicator=indicator
-                        ) """
+                        except Exception as e:
+                            print(f"❌ Error interpolating {indicator} from {tf}: {e}")
+                            # Add column with NaN values as fallback
+                            target_df[f"{indicator}_{tf}"] = pd.NA
 
             # Step 5: Store the processed target dataframe back into the dictionary
             dfs[target_tf] = target_df
@@ -275,13 +275,3 @@ class DataLoader:
         return {
             tf: str(self.data_dir / f"{symbol}-{tf}.json") for tf in timeframes
         }
-
-    def _add_technical_indicators(self, dfs: Dict[ChartInterval, pd.DataFrame]):
-        """
-        Add technical indicators to all dataframes.
-
-        Args:
-            dfs: Dict mapping timeframes to dataframes
-        """
-        for tf, df in dfs.items():
-            add_indicators(df)

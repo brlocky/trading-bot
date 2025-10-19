@@ -28,6 +28,8 @@ Output:
     Example: data/BTCUSDT-15m.json
 """
 
+import sys
+import pandas as pd
 import requests
 import json
 import time
@@ -35,6 +37,10 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
 import argparse
+
+# Add src to path
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root / 'src'))
 
 
 class BinanceDataExtractor:
@@ -320,6 +326,25 @@ class BinanceDataExtractor:
             symbol: Trading pair (e.g., 'BTCUSDT')
             interval: Timeframe in our format (e.g., 'W', 'D', '1h', '15m')
         """
+        from indicator_utils import add_indicators
+
+        print(f"   🔧 Adding technical indicators...", end='', flush=True)
+
+        df = pd.DataFrame(candles)
+
+        # Add technical indicators
+        try:
+            df = add_indicators(df, add_crossovers=True)
+
+            # Convert back to list of dictionaries
+            # Fill NaN values with None for JSON compatibility
+            candles = df.to_dict('records')
+            print(" ✅")
+
+        except Exception as e:
+            print(f" ⚠️  Error adding indicators: {e}")
+            print("   📊 Saving without indicators...")
+
         # Get start and end times from candles
         start_timestamp = candles[0]['time']
         end_timestamp = candles[-1]['time']
@@ -531,10 +556,10 @@ class BinanceDataExtractor:
         print(f"\n📂 Data saved to: {self.output_dir.absolute()}")
         print("=" * 70)
 
-
 # ============================================================
 # DEFAULT SYMBOL LIST (Top 20 cryptocurrencies by market cap)
 # ============================================================
+
 
 DEFAULT_SYMBOLS = [
     'BTCUSDT',   # Bitcoin
@@ -563,6 +588,7 @@ DEFAULT_SYMBOLS = [
 # ============================================================
 # MAIN EXECUTION
 # ============================================================
+
 
 if __name__ == '__main__':
     # Parse command line arguments
@@ -598,7 +624,7 @@ if __name__ == '__main__':
     # Create extractor instance
     extractor = BinanceDataExtractor(output_dir=args.output_dir)
 
-    # Run extraction
+    # Run normal extraction
     extractor.extract_multiple_symbols(
         symbols=args.symbols,
         update_mode=args.update_only,
