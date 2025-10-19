@@ -3,8 +3,8 @@ KISS Indicator Utils
 Minimal shared indicator calculation for both MLTrainer and trade generator.
 """
 
-import numpy as np
 import pandas as pd
+import numpy as np
 import talib
 
 
@@ -60,7 +60,6 @@ def add_indicators(df: pd.DataFrame, add_crossovers: bool = True) -> pd.DataFram
     stoch_k, stoch_d = talib.STOCH(high, low, close, fastk_period=5, slowk_period=3, slowd_period=3)
     df['stochastic_k'] = stoch_k
     df['stochastic_d'] = stoch_d
-
     # === VWAP (reset daily) ===
     # Convert Unix timestamps (seconds) to datetime
     df['time'] = pd.to_datetime(df['time'], unit='s')
@@ -72,7 +71,10 @@ def add_indicators(df: pd.DataFrame, add_crossovers: bool = True) -> pd.DataFram
     cum_vol = df.groupby(days)['volume'].cumsum()
     cum_vp = (df['volume'] * df['close']).groupby(days).cumsum()
 
-    # Assign VWAP
-    df['vwap'] = cum_vp.values / cum_vol.values
+    # Assign VWAP (use numpy arrays to avoid ExtensionArray division and handle zero denominators)
+    num = cum_vp.to_numpy(dtype=float)
+    den = cum_vol.to_numpy(dtype=float)
+    # avoid division by zero; result will be NaN where den == 0
+    df['vwap'] = np.divide(num, den, out=np.full_like(num, np.nan), where=den != 0)
 
     return df

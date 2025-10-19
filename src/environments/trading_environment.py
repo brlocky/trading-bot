@@ -66,6 +66,8 @@ class TradingEnvironment(gym.Env):
             dtype=np.float32
         )
 
+        self.step_history = []
+
     def _prepare_data(self):
         """Prepare normalized data"""
         print("⚡ Pre-normalizing feature data...")
@@ -81,6 +83,7 @@ class TradingEnvironment(gym.Env):
         super().reset(seed=seed)
 
         self.current_step = self.window_size
+        self.step_history = []
         self.broker.reset()
 
         return self._get_obs(), {}
@@ -117,8 +120,9 @@ class TradingEnvironment(gym.Env):
         # Create info
         info = self._create_info(signal, position_size, current_price,
                                  step_pnl,  trade_occurred,
-                                 is_bankrupt)
+                                 is_bankrupt, reward)
 
+        self.step_history.append(info)
         return self._get_obs(), reward, terminated, truncated, info
 
     def _decode_action(self, raw_signal, position_size):
@@ -206,7 +210,7 @@ class TradingEnvironment(gym.Env):
         return obs_array.astype(np.float32)
 
     def _create_info(self, signal, position_size, price, step_pnl, trade_occurred,
-                     is_bankrupt):
+                     is_bankrupt, reward):
         """Create info dictionary with action validation feedback"""
         broker_state = self.broker.get_state()
 
@@ -218,5 +222,6 @@ class TradingEnvironment(gym.Env):
             'step_pnl': step_pnl,
             'trade_occurred': trade_occurred,
             'is_bankrupt': is_bankrupt,
+            'reward': reward,
             **broker_state  # Include all broker state
         }

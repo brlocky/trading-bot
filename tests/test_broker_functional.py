@@ -325,3 +325,120 @@ def test_short_progression_with_price_changes():
     assert final_portfolio == pytest.approx(17250, abs=0.01), "Final portfolio value"
     assert total_pnl == pytest.approx(7250, abs=0.01), "Total P&L (gain)"
     assert broker.balance == final_portfolio, "Balance should equal portfolio value (no position)"
+
+
+def test_short_decrease_capital_used_bug():
+    """
+    Regression test for negative capital_used bug in _decrease_short
+
+    This reproduces the exact sequence from the live data where capital_used
+    became negative at step 2162.
+
+    Sequence from bug:
+    - Step 2161: Open short -0.005 shares @ 115865.5 (exposure 0.633)
+    - Step 2162: Reduce to -0.001 shares @ 115860.01 (exposure 0.258)
+    - Bug: capital_used becomes -115.86 instead of staying positive
+    """
+    broker = TradingBroker(initial_balance=1001.45)
+
+    # Step 2161: Open short with 63.3% exposure at price 115865.5
+    price_1 = 115865.5
+    pnl_1, traded_1, bankrupt_1 = broker.step(
+        signal=-1.0,
+        position_size=0.6332878470420837,
+        price=price_1,
+        step_index=2161
+    )
+
+    # Validate step 2161
+    assert traded_1 is True, "Should execute trade"
+    assert bankrupt_1 is False
+    assert broker.position_shares < 0, "Should be short"
+    assert abs(broker.position_shares) == pytest.approx(0.005, abs=0.0001), "Should be -0.005 shares"
+    assert broker.capital_used > 0, "Capital used should be POSITIVE"
+    assert broker.capital_used == pytest.approx(579.33, abs=1.0), "Capital used should be ~579.33"
+    assert broker.balance == pytest.approx(422.21, abs=1.0), "Balance should be ~422.21"
+
+    # Step 2162: Reduce short to 25.8% exposure at slightly lower price
+    price_2 = 115860.01
+    pnl_2, traded_2, bankrupt_2 = broker.step(
+        signal=-1.0,
+        position_size=0.25854358077049255,
+        price=price_2,
+        step_index=2162
+    )
+
+    # Validate step 2162 - THIS IS WHERE THE BUG OCCURS
+    assert traded_2 is True, "Should execute trade (reducing position)"
+    assert bankrupt_2 is False
+    assert broker.position_shares < 0, "Should still be short"
+    assert abs(broker.position_shares) == pytest.approx(0.001, abs=0.0001), "Should be -0.001 shares"
+
+    # 🐛 THE BUG: capital_used becomes negative
+    assert broker.capital_used >= 0, (
+        f"❌ BUG DETECTED: capital_used is NEGATIVE: {broker.capital_used:.2f}\n"
+        f"Expected: ~115.86 (positive)\n"
+        f"This happens when _decrease_short doesn't properly track released capital"
+    )
+
+    assert broker.capital_used == pytest.approx(115.86, abs=1.0), (
+        f"Capital used should be ~115.86, got {broker.capital_used:.2f}"
+    )
+
+    # Balance should increase (we closed part of short at profit)
+    assert broker.balance > 422.21, f"Balance should increase, got {broker.balance:.2f}"
+
+    # Portfolio should stay roughly the same
+    portfolio = broker.calculate_portfolio_value(price_2)
+    assert portfolio == pytest.approx(1001.57, abs=1.0), (
+        f"Portfolio should be ~1001.57, got {portfolio:.2f}"
+    )
+
+    print(f"\n✅ Test passed - capital_used stayed positive: {broker.capital_used:.2f}")
+
+
+def test_short_close_no_double_counting():
+    """
+    Test that closing a short position does not double-count P&L or capital.
+    The portfolio value before and after closing should only change by the realized P&L.
+    """
+    broker = TradingBroker(initial_balance=1001.0)
+    price_entry = 110309.61
+    price_close = 1112.43  # Simulate a large move for clarity
+
+    # Step 1: Open short position
+    # Use a larger position_size so shares_to_trade >= quantity_precision
+    pnl, traded, bankrupt = broker.step(-1.0, 1.0, price_entry, step_index=0)
+    assert traded is True
+    assert broker.position_shares < 0
+    capital_used_before = broker.capital_used
+    balance_before = broker.balance
+    portfolio_before = broker.calculate_portfolio_value(price_entry)
+
+    # Step 2: Close short position
+    pnl, traded, bankrupt = broker.step(0.0, 0.0, price_close, step_index=1)
+    assert traded is True
+    assert broker.position_shares == 0
+    assert broker.capital_used == 0
+
+    balance_after = broker.balance
+    portfolio_after = broker.calculate_portfolio_value(price_close)
+
+    # The change in portfolio should equal the realized P&L
+    realized_pnl = balance_after - balance_before
+    expected_pnl = abs(capital_used_before) * (price_entry - price_close) / price_entry
+
+    # Portfolio after close should not be artificially boosted
+    assert abs(portfolio_after - (portfolio_before + expected_pnl)) < 1.0, (
+        f"Portfolio boost detected: before={portfolio_before}, after={portfolio_after}, "
+        f"expected change={expected_pnl}, actual change={portfolio_after - portfolio_before}"
+    )
+
+    # Explicitly check that balance is not boosted beyond expected
+    expected_balance = balance_before + expected_pnl
+    assert abs(balance_after - expected_balance) < 1.0, (
+        f"Balance boost detected: before={balance_before}, after={balance_after}, "
+        f"expected change={expected_pnl}, actual change={balance_after - balance_before}"
+    )
+
+    print(f"✅ No double-counting: portfolio and balance change match realized P&L ({realized_pnl:.2f})")

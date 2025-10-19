@@ -45,7 +45,12 @@ class TradingBroker:
 
     def step(self, signal: float, position_size: float, price: float, step_index: int = 0) -> Tuple[float, bool, bool]:
         """
-        Execute trading step
+        Execute trading step with proper P&L attribution
+
+        P&L Calculation:
+        - Market P&L: Price movement on existing position BEFORE any trade
+        - Realized P&L: P&L from closing/reducing positions during the trade
+        - Step P&L: Market P&L + Realized P&L (excludes capital reallocation)
 
         Args:
             signal: -1 (short), 0 (hold/reduce), 1 (long)
@@ -58,9 +63,13 @@ class TradingBroker:
         """
         self._validate_inputs(signal, position_size)
 
-        # Calculate portfolio value before step
+        print(f"\n[step] step_index={step_index}, signal={signal}, position_size={position_size}, price={price}")
+        print(
+            f"  BEFORE: position_shares={self.position_shares}, entry_price={self.entry_price}, balance={self.balance}, capital_used={self.capital_used}")
+        # Store old position state for P&L calculation
+        old_position_shares = self.position_shares
+        old_entry_price = self.entry_price
         price_before = self.last_price if self.last_price > 0 else price
-        portfolio_before = self.calculate_portfolio_value(price_before)
 
         # Check bankruptcy
         is_bankrupt = self.is_bankrupt(price)
@@ -68,33 +77,39 @@ class TradingBroker:
             self._force_liquidate(price)
             return 0.0, True, True
 
+        # Calculate market P&L BEFORE any trade (price movement on existing position)
+        market_pnl = 0.0
+        if abs(old_position_shares) > self.quantity_precision and price_before > 0:
+            if old_position_shares > 0:  # Long position
+                market_pnl = old_position_shares * (price - price_before)
+            else:  # Short position
+                market_pnl = abs(old_position_shares) * (price_before - price)
+            market_pnl = round(market_pnl, 2)
+
         # Execute trading logic
         trade_occurred = False
+        realized_pnl = 0.0
 
         if signal == 0:
-            # Reduce position
-            _, trade_occurred = self._reduce_position(position_size, price)
+            print(f"  [step] Calling _reduce_position with keep_fraction={position_size}")
+            realized_pnl, trade_occurred = self._reduce_position(position_size, price)
         else:
-            # Target new position (signal = 1 or -1)
             direction = int(np.sign(signal))
-
-            # Check if we're already in this direction
             current_direction = int(np.sign(self.position_shares)) if abs(self.position_shares) > self.quantity_precision else 0
-
             if current_direction == direction:
-                # Reduce position
-                _, trade_occurred = self._reduce_position(position_size, price)
+                print(f"  [step] Already in direction {direction}, calling _reduce_position with keep_fraction={position_size}")
+                realized_pnl, trade_occurred = self._reduce_position(position_size, price)
             else:
-                # Opening new position or reversing - use portfolio-based exposure
-                _, trade_occurred = self._target_position(direction, position_size, price)
+                print(f"  [step] Changing direction to {direction}, calling _target_position with exposure={position_size}")
+                realized_pnl, trade_occurred = self._target_position(direction, position_size, price)
 
-        # Calculate step P&L
-        portfolio_after = self.calculate_portfolio_value(price)
-        step_pnl = portfolio_after - portfolio_before
+        # Total step P&L = market P&L from price movement + realized P&L from trade
+        step_pnl = market_pnl + realized_pnl
 
+        print(
+            f"  AFTER: position_shares={self.position_shares}, entry_price={self.entry_price}, balance={self.balance}, capital_used={self.capital_used}, step_pnl={step_pnl}, traded={trade_occurred}")
         self.last_price = price
         self._record_step(step_index, price, signal, position_size, step_pnl, trade_occurred)
-
         return step_pnl, trade_occurred, False
 
     def close(self, price: float, step_index: int) -> Dict:
@@ -244,9 +259,9 @@ class TradingBroker:
             # Has long position
             if shares_to_trade > 0:
                 return self._increase_long(shares_to_trade, price)
-            elif new_position > self.quantity_precision:
+            elif new_position >= self.quantity_precision:
                 return self._decrease_long(shares_to_trade, price)
-            elif abs(new_position) < self.quantity_precision:
+            elif abs(new_position) <= self.quantity_precision:
                 return self._close_long(shares_to_trade, price)
             else:
                 return self._reverse_long_to_short(shares_to_trade, price)
@@ -255,9 +270,9 @@ class TradingBroker:
             # Has short position
             if shares_to_trade < 0:
                 return self._increase_short(shares_to_trade, price)
-            elif new_position < -self.quantity_precision:
+            elif new_position <= -self.quantity_precision:
                 return self._decrease_short(shares_to_trade, price)
-            elif abs(new_position) < self.quantity_precision:
+            elif abs(new_position) <= self.quantity_precision:
                 return self._close_short(shares_to_trade, price)
             else:
                 return self._reverse_short_to_long(shares_to_trade, price)
@@ -494,6 +509,7 @@ class TradingBroker:
 
         self.total_trades += 1
         return realized_pnl, True
+
     # ============================================================================
     # CALCULATIONS - Pure functions
     # ============================================================================
