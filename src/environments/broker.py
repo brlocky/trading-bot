@@ -63,9 +63,6 @@ class TradingBroker:
         """
         self._validate_inputs(signal, position_size)
 
-        print(f"\n[step] step_index={step_index}, signal={signal}, position_size={position_size}, price={price}")
-        print(
-            f"  BEFORE: position_shares={self.position_shares}, entry_price={self.entry_price}, balance={self.balance}, capital_used={self.capital_used}")
         # Store old position state for P&L calculation
         old_position_shares = self.position_shares
         old_entry_price = self.entry_price
@@ -91,23 +88,18 @@ class TradingBroker:
         realized_pnl = 0.0
 
         if signal == 0:
-            print(f"  [step] Calling _reduce_position with keep_fraction={position_size}")
             realized_pnl, trade_occurred = self._reduce_position(position_size, price)
         else:
             direction = int(np.sign(signal))
             current_direction = int(np.sign(self.position_shares)) if abs(self.position_shares) > self.quantity_precision else 0
             if current_direction == direction:
-                print(f"  [step] Already in direction {direction}, calling _reduce_position with keep_fraction={position_size}")
                 realized_pnl, trade_occurred = self._reduce_position(position_size, price)
             else:
-                print(f"  [step] Changing direction to {direction}, calling _target_position with exposure={position_size}")
                 realized_pnl, trade_occurred = self._target_position(direction, position_size, price)
 
         # Total step P&L = market P&L from price movement + realized P&L from trade
         step_pnl = market_pnl + realized_pnl
 
-        print(
-            f"  AFTER: position_shares={self.position_shares}, entry_price={self.entry_price}, balance={self.balance}, capital_used={self.capital_used}, step_pnl={step_pnl}, traded={trade_occurred}")
         self.last_price = price
         self._record_step(step_index, price, signal, position_size, step_pnl, trade_occurred)
         return step_pnl, trade_occurred, False

@@ -98,7 +98,7 @@ def get_features_list() -> Dict[str, str]:
 def get_default_environment_config():
     """Get default trading environment configuration optimized for stability"""
     return {
-        'initial_balance': 1000.0,
+        'initial_balance': 100000.0,
         'buy_threshold': 0.5,         # 🛡️ STABLE: 0.3 → 0.5 (more conservative thresholds)
         'sell_threshold': -0.5,       # 🛡️ STABLE: -0.3 → -0.5 (more conservative thresholds)
     }
@@ -116,24 +116,24 @@ def get_model_config():
         'window_size': 336,
 
         # PPO hyperparameters - DUAL LEARNING RATES
-        'learning_rate': lambda f: 3e-4 * f,  # Linearly decay LR
+        'learning_rate': lambda f: 5e-4 * f,  # Linearly decay LR
         'n_steps': 2048,                  # 🔧 INCREASED: 1024 → 2048 (longer rollouts)
         'batch_size_gpu': 256,            # Keep large batches
         'batch_size_cpu': 128,
-        'n_epochs': 4,                    # 🔧 REDUCED: Was unstable with 10
+        'n_epochs': 25,                    # 🔧 REDUCED: Was unstable with 10
         'gamma': 0.99,
         'gae_lambda': 0.95,
-        'clip_range': 0.1,     # ← ADD THIS: More conservative updates
+        'clip_range': 0.3,     # ← ADD THIS: More conservative updates
 
         # Additional hyperparameters - VALUE FUNCTION FOCUS
         'clip_range_vf': None,            # 🔧 DISABLED: Let VF learn freely
         'normalize_advantage': True,
-        'target_kl': 0.03,  # stop epoch if KL > 0.03
+        'target_kl': 0.4,  # stop epoch if KL > 0.03
         'stats_window_size': 25,
         'seed': 42,
 
         'ent_coef': 0.01,                 # 🔧 REDUCED: 0.02 → 0.01 (less randomness)
-        'vf_coef': 1,                   # 🔧 Better value function learning
+        'vf_coef': 2.0,                   # 🔧 Better value function learning
         'max_grad_norm': 0.5,
         'use_sde': False,
         'sde_sample_freq': -1,
@@ -142,9 +142,9 @@ def get_model_config():
         'n_envs': 4,                      # 🔧 REDUCED: 8 → 4 (higher quality rollouts)
 
         # Network architecture
-        'hidden_layers_vf': [256, 256],
+        'hidden_layers_vf': [1024, 1024],
         'hidden_layers_pi': [256, 128],
-        'lstm_hidden_size': 128,
+        'lstm_hidden_size': 256,
         'activation_function': 'tanh',
         'ortho_init': True,
     }
