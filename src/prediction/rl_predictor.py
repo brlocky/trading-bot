@@ -325,7 +325,6 @@ class RLPredictor:
             obs, reward, done, truncated, info = env.step([signal, raw_position_size])
 
             if done or truncated:
-                env.broker.close(info['price'], info['step'])
                 break
 
         # Create results DataFrame

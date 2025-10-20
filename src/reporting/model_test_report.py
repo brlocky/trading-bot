@@ -124,7 +124,7 @@ def create_simple_charts(results_df):
     fig.add_trace(
         go.Scatter(
             x=results_df.index,
-            y=results_df['balance'] + results_df['capital_used'] + results_df['unrealized_pnl'],
+            y=results_df['cash'] + results_df['unrealized_pnl'],
             mode='lines',
             name='Balance',
             line=dict(color='rgb(0, 200, 0)', width=4)
@@ -196,15 +196,13 @@ def print_simple_metrics(results_df):
     """Print simple performance metrics"""
 
     total_pnl = results_df['step_pnl'].sum()
-    final_balance = results_df['balance'].iloc[-1]
-    initial_balance = results_df['balance'].iloc[0]
+    final_balance = results_df['cash'].iloc[-1]
     total_trades = results_df['traded'].sum()
 
     print("\n📊 SIMPLE PERFORMANCE SUMMARY")
     print("=" * 40)
     print(f"💰 Total P&L: ${total_pnl:,.2f}")
     print(f"💼 Final Balance: ${final_balance:,.2f}")
-    print(f"📈 Return: {((final_balance - initial_balance) / initial_balance * 100):,.1f}%")
     print(f"🔄 Total Trades: {total_trades}")
 
 

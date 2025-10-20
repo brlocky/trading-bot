@@ -36,3 +36,30 @@ class TestPortfolioValue:
     def test_portfolio_value_no_position(self):
         broker = TradingBroker(initial_balance=10000.0)
         assert broker.calculate_portfolio_value(100.0) == 10000.0
+
+
+class TestCalculateRoundedShareSize:
+    """Test calculate_rounded_share_size method"""
+
+    def test_calculate_rounded_share_size(self):
+
+        broker = TradingBroker(initial_balance=10000.0, quantity_precision=1)
+        assert broker.calculate_max_share_size(1.0, 0.1) == 10
+        assert broker.calculate_max_share_size(1.0, 1) == 1
+        assert broker.calculate_max_share_size(1.0, 10) == 0
+        assert broker.calculate_max_share_size(1.0, 100) == 0
+        assert broker.calculate_max_share_size(1.0, 1000) == 0
+
+        broker = TradingBroker(initial_balance=10000.0, quantity_precision=0.1)
+        assert broker.calculate_max_share_size(1.0, 0.1) == 10.0
+        assert broker.calculate_max_share_size(1.0, 1) == 1.0
+        assert broker.calculate_max_share_size(1.0, 10) == 0.1
+        assert broker.calculate_max_share_size(1.0, 100) == 0.0
+        assert broker.calculate_max_share_size(1.0, 1000) == 0
+
+        broker = TradingBroker(initial_balance=1000.0, quantity_precision=0.0001)
+        assert broker.calculate_max_share_size(1.0, 0.1) == 10.0
+        assert broker.calculate_max_share_size(1.0, 1) == 1.0
+        assert broker.calculate_max_share_size(1.0, 10) == 0.1
+        assert broker.calculate_max_share_size(1.0, 100) == 0.01
+        assert broker.calculate_max_share_size(1.0, 1000) == 0.001

@@ -125,7 +125,7 @@ class TradingEnvironment(gym.Env):
         self.step_history.append(info)
         return self._get_obs(), reward, terminated, truncated, info
 
-    def _decode_action(self, raw_signal, position_size):
+    def _decode_action(self, raw_signal, position_size) -> tuple[int, float]:
         """Convert raw action to trading signal"""
         if raw_signal >= self.buy_threshold:
             return 1, position_size  # BUY
@@ -137,7 +137,7 @@ class TradingEnvironment(gym.Env):
     def _calculate_reward(self, step_pnl, current_price):
         """Simple percentage-based reward - proven to work"""
 
-        total_portfolio = self.broker.balance + self.broker.capital_used
+        total_portfolio = self.broker.cash + self.broker.cash_used
         initial_balance = self.broker.initial_balance
 
         # Simple percentage returns (already normalized to 0-1 range)
@@ -151,63 +151,69 @@ class TradingEnvironment(gym.Env):
         return np.clip(reward, -0.5, 0.5)
 
     def _get_obs(self):
-        """Get observation window - fully vectorized for LSTM"""
-        end_step = self.current_step
-        start_step = end_step - self.window_size + 1
-        steps = np.arange(max(0, start_step), end_step + 1)
-        actual_window_size = len(steps)
+        try:
+            """Get observation window - fully vectorized for LSTM"""
+            end_step = self.current_step
+            start_step = end_step - self.window_size + 1
+            steps = np.arange(max(0, start_step), end_step + 1)
+            actual_window_size = len(steps)
 
-        # Clamp feature access
-        batch_features = self.normalized_features[np.clip(steps, 0, len(self.normalized_features) - 1)]
-        current_prices = self.df['close'].iloc[np.clip(steps, 0, len(self.df) - 1)].values
-        initial_balance = self.broker.initial_balance
+            # Clamp feature access
+            batch_features = self.normalized_features[np.clip(steps, 0, len(self.normalized_features) - 1)]
+            current_prices = self.df['close'].iloc[np.clip(steps, 0, len(self.df) - 1)].values
+            initial_balance = self.broker.initial_balance
 
-        # Gather broker states
-        broker_states = []
-        for step, price in zip(steps, current_prices):
-            history_index = step - self.window_size
-            if 0 <= history_index < len(self.broker.step_history):
-                state = self.broker.step_history[history_index]
-            else:
-                state = self.broker.create_step_state(step, price, 0, 0.0, 0.0, False)
-            broker_states.append(state)
+            # Gather broker states
+            broker_states = []
+            for step, price in zip(steps, current_prices):
+                history_index = step - self.window_size
+                if 0 <= history_index < len(self.broker.step_history):
+                    state = self.broker.step_history[history_index]
+                else:
+                    state = self.broker._create_step_record(int(step), price, 0, 0.0, 0.0, False)
+                broker_states.append(state)
 
-        # Vectorized normalization
-        position_size = np.array([s['position_size'] for s in broker_states], dtype=np.float32)
-        signal = np.array([s['signal'] for s in broker_states], dtype=np.float32)
-        position_sign = np.sign(np.array([s['position_shares'] for s in broker_states]))
-        position_shares = np.array([s['position_shares'] for s in broker_states], dtype=np.float32)
-        position_shares_scaled = position_shares / self.broker.quantity_precision
+            # Vectorized normalization
+            position_size = np.array([s['position_size'] for s in broker_states], dtype=np.float32)
+            signal = np.array([s['signal'] for s in broker_states], dtype=np.float32)
+            position_sign = np.sign(np.array([s['position_shares'] for s in broker_states]))
+            position_shares = np.array([s['position_shares'] for s in broker_states], dtype=np.float32)
+            position_shares_scaled = position_shares / self.broker.quantity_precision
 
-        step_pnl = np.array([s['step_pnl'] for s in broker_states], dtype=np.float32) / initial_balance
-        portfolio_ratio = np.array([s['portfolio_value'] for s in broker_states], dtype=np.float32) / initial_balance
-        capital_available = np.array([s['balance'] for s in broker_states], dtype=np.float32) / initial_balance
-        capital_used = np.array([s['capital_used'] for s in broker_states], dtype=np.float32) / initial_balance
-        total_trades = np.tanh(np.array([s['total_trades'] for s in broker_states]) / 10000.0)
+            step_pnl = np.array([s['step_pnl'] for s in broker_states], dtype=np.float32) / initial_balance
+            portfolio_ratio = np.array([s['equity'] for s in broker_states], dtype=np.float32) / initial_balance
+            capital_available = np.array([s['cash'] for s in broker_states], dtype=np.float32) / initial_balance
+            capital_used = np.array([s['cash_used'] for s in broker_states], dtype=np.float32) / initial_balance
+            total_trades = np.tanh(np.array([s['total_trades'] for s in broker_states]) / 10000.0)
 
-        # Assemble account info
-        account_info = np.stack([
-            signal,
-            position_size,
-            portfolio_ratio,
-            capital_available,
-            position_sign,
-            position_shares_scaled,
-            step_pnl,
-            total_trades,
-            capital_used,
-            np.ones(actual_window_size, dtype=np.float32)  # bias term
-        ], axis=1)
+            # Assemble account info
+            account_info = np.stack([
+                signal,
+                position_size,
+                portfolio_ratio,
+                capital_available,
+                position_sign,
+                position_shares_scaled,
+                step_pnl,
+                total_trades,
+                capital_used,
+                np.ones(actual_window_size, dtype=np.float32)  # bias term
+            ], axis=1)
 
-        # Concatenate features + broker info
-        obs_array = np.concatenate([batch_features, account_info], axis=1)
+            # Concatenate features + broker info
+            obs_array = np.concatenate([batch_features, account_info], axis=1)
 
-        # Pad at beginning if window < window_size
-        if obs_array.shape[0] < self.window_size:
-            pad_rows = self.window_size - obs_array.shape[0]
-            obs_array = np.vstack([np.zeros((pad_rows, obs_array.shape[1]), dtype=np.float32), obs_array])
+            # Pad at beginning if window < window_size
+            if obs_array.shape[0] < self.window_size:
+                pad_rows = self.window_size - obs_array.shape[0]
+                obs_array = np.vstack([np.zeros((pad_rows, obs_array.shape[1]), dtype=np.float32), obs_array])
 
-        return obs_array.astype(np.float32)
+            return obs_array.astype(np.float32)
+        except Exception as e:
+            print(f"❌ Error in _get_obs: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise e
 
     def _create_info(self, signal, position_size, price, step_pnl, trade_occurred,
                      is_bankrupt, reward):
