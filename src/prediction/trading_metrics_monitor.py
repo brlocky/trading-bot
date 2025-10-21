@@ -50,7 +50,7 @@ class TradingMetricsMonitor(BaseCallback):
                 info = infos[idx]
                 episode_data['balances'].append(info.get('balance', 0))
                 episode_data['positions'].append(info.get('position', 0))
-                if info.get('trade_occurred', False):
+                if info.get('traded', False):
                     episode_data['trades'].append(info.get('step_pnl', 0))
 
             if done:

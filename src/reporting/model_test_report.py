@@ -5,6 +5,8 @@ Simple Model Testing Report for RL Trading Bot - KISS Implementation
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from src.core.normalization_config import get_default_environment_config
+
 
 def create_simple_charts(results_df):
     """Create simple 5-panel trading visualization"""
@@ -30,8 +32,21 @@ def create_simple_charts(results_df):
     )
 
     # Add buy/sell signals
-    buy_signals = results_df[results_df['signal'] == 1]
-    sell_signals = results_df[results_df['signal'] == -1]
+    buy_signals = results_df[
+        (results_df['signal'] == 1) &
+        (results_df['position_shares'] > 0) &
+        (results_df['traded'])
+    ]
+    sell_signals = results_df[
+        (results_df['signal'] == -1) &
+        (results_df['position_shares'] < 0) &
+        (results_df['traded'])
+    ]
+
+    close_signals = results_df[
+        (results_df['position_shares'] == 0) &
+        (results_df['traded'])
+    ]
 
     if not buy_signals.empty:
         fig.add_trace(
@@ -40,7 +55,7 @@ def create_simple_charts(results_df):
                 y=buy_signals['price'],
                 mode='markers',
                 name='Buy',
-                marker=dict(color='rgb(0, 255, 0)', size=16, symbol='triangle-up', line=dict(color='rgb(0, 128, 0)', width=3))
+                marker=dict(color='rgb(0, 255, 0)', size=16, symbol='triangle-up', line=dict(color='rgb(0, 255, 0)', width=1))
             ),
             row=1, col=1
         )
@@ -52,7 +67,19 @@ def create_simple_charts(results_df):
                 y=sell_signals['price'],
                 mode='markers',
                 name='Sell',
-                marker=dict(color='rgb(255, 0, 0)', size=16, symbol='triangle-down', line=dict(color='rgb(128, 0, 0)', width=3))
+                marker=dict(color='rgb(255, 0, 0)', size=16, symbol='triangle-down', line=dict(color='rgb(255, 0, 0)', width=1))
+            ),
+            row=1, col=1
+        )
+
+    if not close_signals.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=close_signals.index,
+                y=close_signals['price'],
+                mode='markers',
+                name='Close',
+                marker=dict(color='rgb(255, 255, 255)', size=16, symbol='circle', line=dict(color='rgb(0, 0, 0)', width=1))
             ),
             row=1, col=1
         )
@@ -124,7 +151,7 @@ def create_simple_charts(results_df):
     fig.add_trace(
         go.Scatter(
             x=results_df.index,
-            y=results_df['cash'] + results_df['unrealized_pnl'],
+            y=results_df['cash'],
             mode='lines',
             name='Balance',
             line=dict(color='rgb(0, 200, 0)', width=4)
@@ -192,18 +219,29 @@ def create_simple_charts(results_df):
     return fig
 
 
-def print_simple_metrics(results_df):
-    """Print simple performance metrics"""
+def print_simple_metrics(results_df, initial_balance):
+    """Print simple performance metrics with trade breakdown"""
 
     total_pnl = results_df['step_pnl'].sum()
-    final_balance = results_df['cash'].iloc[-1]
+    final_balance = results_df['equity'].iloc[-1]
     total_trades = results_df['traded'].sum()
+    num_longs = ((results_df['signal'] == 1) & (results_df['traded'])).sum()
+    num_shorts = ((results_df['signal'] == -1) & (results_df['traded'])).sum()
+    num_profitable = (results_df['step_pnl'] > 0).sum()
+    num_losing = (results_df['step_pnl'] < 0).sum()
+    net_return = final_balance - initial_balance
 
     print("\n📊 SIMPLE PERFORMANCE SUMMARY")
     print("=" * 40)
-    print(f"💰 Total P&L: ${total_pnl:,.2f}")
+    print(f"💰 Initial Balance: ${initial_balance:,.2f}")
     print(f"💼 Final Balance: ${final_balance:,.2f}")
+    print(f"📊 Net Return: ${net_return:,.2f}")
+    print(f"💰 Total P&L: ${total_pnl:,.2f}")
     print(f"🔄 Total Trades: {total_trades}")
+    print(f"📈 Long Trades: {num_longs}")
+    print(f"📉 Short Trades: {num_shorts}")
+    print(f"✅ Profitable Steps: {num_profitable}")
+    print(f"❌ Losing Steps: {num_losing}")
 
 
 def quick_test_model(model_dir, symbol='BTCUSDT', test_candles=500):
@@ -223,6 +261,9 @@ def quick_test_model(model_dir, symbol='BTCUSDT', test_candles=500):
         dfs = loader.load_data(symbol)
         test_data = dfs['15m'].tail(test_candles)
 
+        config = get_default_environment_config()
+        initial_balance = config['initial_balance']
+
         # Create predictor and generate predictions
         print("🤖 Loading model and generating predictions...")
         predictor = RLPredictor(model_dir=model_dir)
@@ -232,7 +273,7 @@ def quick_test_model(model_dir, symbol='BTCUSDT', test_candles=500):
         print(f"📊 Columns: {list(results_df.columns)}")
 
         # Show simple metrics
-        print_simple_metrics(results_df)
+        print_simple_metrics(results_df, initial_balance=initial_balance)
 
         # Create and show chart
         fig = create_simple_charts(results_df)

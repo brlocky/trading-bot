@@ -24,17 +24,16 @@ def add_indicators(df: pd.DataFrame, add_crossovers: bool = True) -> pd.DataFram
     df['rsi'] = talib.RSI(close, timeperiod=14)
 
     # === MACD ===
-    macd, macd_signal, _ = talib.MACD(close)
+    macd, macd_signal, macd_history = talib.MACD(close)
     df['macd'] = macd
     df['macd_signal'] = macd_signal
-    df['macd_hist'] = macd - macd_signal  # centered around 0
+    df['macd_hist'] = macd_history
 
     # === Bollinger Bands ===
     bb_upper, bb_middle, bb_lower = talib.BBANDS(close, timeperiod=20)
     df['bb_upper'] = bb_upper
     df['bb_lower'] = bb_lower
-    df['bb_position'] = (close - bb_lower) / (bb_upper - bb_lower)
-    df['bb_position'] = df['bb_position'].clip(0, 1)
+    df['bb_middle'] = bb_middle
 
     # === Volume-based ===
     df['volume_ma20'] = talib.SMA(volume, timeperiod=20)

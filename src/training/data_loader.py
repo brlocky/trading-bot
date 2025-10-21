@@ -4,6 +4,7 @@ from typing import Dict, List
 import pandas as pd
 from core.trading_types import ChartInterval
 from core.normalization_config import get_features_list
+from src.indicator_utils import add_indicators
 
 
 class DataLoader:
@@ -126,6 +127,8 @@ class DataLoader:
 
             # Merge levels with target timeframe candle data
             target_df = dfs[target_tf]
+
+            [add_indicators(dfs[tf], add_crossovers=True) for tf in timeframes]
 
             # Align indices
             target_df = target_df.reindex(target_df.index)

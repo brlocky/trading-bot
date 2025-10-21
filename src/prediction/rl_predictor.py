@@ -121,7 +121,7 @@ class RLPredictor:
                 vf=self.train_config['hidden_layers_vf']     # [256, 256]
             ),
             "lstm_hidden_size": self.train_config['lstm_hidden_size'],  # 256
-            "activation_fn": getattr(torch.nn, self.train_config['activation_function'].title()),  # Remove ()
+            "activation_fn": getattr(torch.nn, self.train_config['activation_function']),  # Remove ()
             "ortho_init": self.train_config['ortho_init']
         }
 
@@ -328,12 +328,12 @@ class RLPredictor:
                 break
 
         # Create results DataFrame
-        if len(env.broker.step_history) == 0:
+        if len(env.step_history) == 0:
             print("⚠️ No predictions generated - creating empty DataFrame with correct structure")
             # Create empty DataFrame
             return pd.DataFrame()
 
-        results_df = pd.DataFrame(env.broker.step_history)
-        results_df.index = df.index[self.train_config['window_size']:self.train_config['window_size'] + len(env.broker.step_history)]
+        results_df = pd.DataFrame(env.step_history)
+        results_df.index = df.index[self.train_config['window_size']:self.train_config['window_size'] + len(env.step_history)]
 
         return results_df

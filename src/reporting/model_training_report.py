@@ -545,7 +545,7 @@ class ModelTrainingReport:
 
         # Extract key metrics from step history
         total_steps = len(broker_history)
-        trade_steps = [step for step in broker_history if step.get('trade_occurred')]
+        trade_steps = [step for step in broker_history if step.get('traded')]
 
         # Calculate trading statistics
         total_trades = len(trade_steps)
@@ -612,9 +612,9 @@ class ModelTrainingReport:
         unrealized_pnls = [step.get('unrealized_pnl', 0) for step in broker_history]
 
         # Trade markers (for scatter overlay)
-        trade_steps = [step.get('step', i) for i, step in enumerate(broker_history) if step.get('trade_occurred')]
-        trade_prices = [step.get('price', 0) for step in broker_history if step.get('trade_occurred')]
-        trade_signals = [step.get('signal', 0) for step in broker_history if step.get('trade_occurred')]
+        trade_steps = [step.get('step', i) for i, step in enumerate(broker_history) if step.get('traded')]
+        trade_prices = [step.get('price', 0) for step in broker_history if step.get('traded')]
+        trade_signals = [step.get('signal', 0) for step in broker_history if step.get('traded')]
 
         return {
             'time_series': {

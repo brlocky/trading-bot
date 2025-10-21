@@ -128,20 +128,18 @@ class StandardNormalizer(BaseNormalizer):
 
 
 class VolumeLogNormalizer(BaseNormalizer):
-    """Log normalization for volume data with NaN handling"""
+    """Log normalization for volume data, scaled to [0, 1] with NaN handling"""
 
     def fit(self, data: np.ndarray, **kwargs) -> 'VolumeLogNormalizer':
-        # Only use non-NaN values for fitting
         valid_mask = ~np.isnan(data)
         if np.sum(valid_mask) > 1:
             valid_data = data[valid_mask]
-            log_data = np.log(valid_data + 1)
-            self.stats['mean'] = np.mean(log_data)
-            self.stats['std'] = np.std(log_data) + 1e-8
+            log_data = np.log1p(valid_data)
+            self.stats['min'] = np.min(log_data)
+            self.stats['max'] = np.max(log_data)
         else:
-            # Fallback for all-NaN data
-            self.stats['mean'] = 0.0
-            self.stats['std'] = 1.0
+            self.stats['min'] = 0.0
+            self.stats['max'] = 1.0
 
         self.is_fitted = True
         return self
@@ -150,14 +148,14 @@ class VolumeLogNormalizer(BaseNormalizer):
         if not self.is_fitted:
             raise ValueError("Normalizer must be fitted before transform")
 
-        # Replace NaN with 1 (so log(1+1) = log(2), then standardized)
-        filled_data = np.where(np.isnan(data), 1.0, data)
-        try:
-            log_data = np.log(filled_data + 1)
-            return (log_data - self.stats['mean']) / self.stats['std']
-        except Exception as e:
-            print(f"Error in VolumeLogNormalizer transform: {e}")
-            return np.zeros_like(data)
+        # Replace NaN with 0 (log1p(0) = 0)
+        filled_data = np.where(np.isnan(data), 0.0, data)
+        log_data = np.log1p(filled_data)
+        min_log = self.stats['min']
+        max_log = self.stats['max']
+        # Scale to [0, 1]
+        scaled = (log_data - min_log) / (max_log - min_log + 1e-8)
+        return scaled
 
 
 class IdentityNormalizer(BaseNormalizer):
@@ -193,13 +191,12 @@ class FeatureNormalizer:
         self.normalizer_factory = {
             'price_ratio': lambda: PriceRatioNormalizer(),
             'price_baseline': lambda: IdentityNormalizer(),  # Close price always 0
-            'bounded_0_100': lambda: BoundedNormalizer((0, 100), (-1, 1)),
-            'bounded_0_1': lambda: BoundedNormalizer((0, 1), (-1, 1)),
-            'bounded_neg100_0': lambda: BoundedNormalizer((-100, 0), (-1, 1)),
-            'oscillator': lambda: StandardNormalizer((-3, 3)),
+            'bounded_0_100': lambda: BoundedNormalizer((0, 100), (0, 1)),
+            'bounded_0_1': lambda: BoundedNormalizer((0, 1), (0, 1)),
+            'oscillator': lambda: StandardNormalizer((-1, 1)),
             'volume_log': lambda: VolumeLogNormalizer(),
             'ratio': lambda: IdentityNormalizer(),
-            'standard': lambda: StandardNormalizer((-3, 3)),
+            'standard': lambda: StandardNormalizer((-1, 1)),
         }
 
     def fit(self, df: pd.DataFrame, close_prices: Optional[pd.Series] = None) -> 'FeatureNormalizer':
@@ -341,5 +338,4 @@ class FeatureNormalizer:
         normalizer.feature_columns = list(save_data['config'].keys())
         normalizer.is_fitted = True
 
-        print(f"📥 Loaded normalizer from {filepath}")
         return normalizer

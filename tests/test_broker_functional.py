@@ -1,8 +1,4 @@
-"""
-Functional Tests for TradingBroker
-Tests step() method with realistic trading patterns
-Validates all 4 return values: (step_pnl_pct,trade_occurred, is_bankrupt)
-"""
+
 
 from environments.broker import TradingBroker
 import pytest
@@ -10,6 +6,32 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
+
+
+def test_buy_empty():
+    """Test: Buy -> Hold pattern"""
+    broker = TradingBroker(initial_balance=10000.0)
+    price = 100.0
+
+    # Step 1: Buy 0% long
+    pnl, traded, bankrupt = broker.step(1.0, 0, price, step_index=0)
+    assert traded is False
+    assert bankrupt is False
+    assert broker.cash == 10000.0
+    assert broker.cash_used == 0.0
+    assert broker.position_shares == 0.0
+    assert broker.entry_price == 0.0
+    assert pnl == 0.0
+
+    # Step 1: Buy 0% long
+    pnl, traded, bankrupt = broker.step(-1.0, 0, price, step_index=0)
+    assert traded is False
+    assert bankrupt is False
+    assert broker.cash == 10000.0
+    assert broker.cash_used == 0.0
+    assert broker.position_shares == 0.0
+    assert broker.entry_price == 0.0
+    assert pnl == 0.0
 
 
 def test_buy_hold_pattern():
@@ -172,6 +194,7 @@ def test_sell_short_pattern_with_loss():
     assert traded is True
     assert broker.position_shares == -100.0  # No commission, exact shares
     assert broker.cash_used == 10000.0
+    assert broker.entry_price == 100.0
     # Cash is the realized balance and remains unchanged until PnL is realized
     assert broker.cash == 20000.0
     assert pnl == 0.0  # No commission, no PnL yet
@@ -197,6 +220,67 @@ def test_sell_short_pattern_with_loss():
     assert broker.position_shares == 0.0
     assert broker.cash_used == 0.0
     assert broker.cash == 15000.0  # $10k free + $10k capital - $5k pnl = $15k
+
+
+def test_sell_short_short_entry_price():
+    broker = TradingBroker(initial_balance=10000.0)
+    price_initial = 100.0
+    price_lower = 50.0
+
+    # Step 1: Sell short 50%
+    pnl, traded, bankrupt = broker.step(-1.0, 0.5, price_initial, step_index=0)
+    assert traded is True
+    assert broker.position_shares == -50.0  # No commission, exact shares
+    assert broker.cash_used == 5000.0
+    assert broker.entry_price == 100.0
+    assert broker.cash == 10000.0
+    assert pnl == 0.0
+
+    # Step 2: Increase short to 100% and verify entry price adjusts correctly
+    pnl, traded, bankrupt = broker.step(-1.0, 1, price_lower, step_index=1)
+    assert traded is True
+    assert pnl == 2500
+    assert broker.position_shares == -150.0
+    assert broker.cash_used == 10000.5  # BUG on precision
+    assert broker.cash == 10000.0
+    assert broker.entry_price == 66.67
+
+
+def test_short_close():
+    broker = TradingBroker(initial_balance=99968.31)
+
+    # Step 1: Sell short
+    pnl, traded, bankrupt = broker.step(-1.0, 0.0025666533038020134, 110274.46, step_index=0)
+    assert traded is True
+    assert broker.position_shares == -0.002
+    assert broker.cash_used == 220.55
+    assert broker.entry_price == 110274.46
+    assert broker.cash == 99968.31
+    assert pnl == 0.0
+
+    # Step 2: Sell short 50%
+    pnl, traded, bankrupt = broker.step(-1.0, 0.17951692640781403, 110949.22, step_index=0)
+    assert traded is True
+    assert broker.position_shares == -0.161  # No commission, exact shares
+    assert broker.cash_used == 17861.48
+    assert broker.entry_price == 110940.84
+    assert broker.cash == 99968.31
+    assert pnl == pytest.approx(-1.349, abs=1e-3)
+
+    # Step 3: Increase short to 100% and verify entry price adjusts correctly
+    pnl, traded, bankrupt = broker.step(-1.0, 0, 111242.26, step_index=1)
+    assert traded is True
+    assert pnl == pytest.approx(-47.18, abs=1e-2)
+    assert broker.position_shares == 0.0
+    assert broker.cash_used == 0.0
+    assert broker.cash == 99919.78
+    assert broker.entry_price == 0.0
+
+
+""" 2025-10-11 08: 00: 00	110274.46 - 0.00031684979249879675	763 - 1	0.0025666533038020134	110274.46 - 0.002	99968.31	220.55	0.0	99968.31	100007.11	0.0	True	12	False
+2025-10-11 08: 15: 00	110949.22 - 0.00033033722663966536	764 - 1	0.17951692640781403	110940.84 - 0.161	99968.31	17861.48 - 1.3491800000007497	99966.96	100007.11 - 1.3495199999999896	True	13	False
+2025-10-11 08: 30: 00	111242.26 - 0.0008018925122152964	765 - 1	0.0	110940.84 - 0.001	99920.08	110.94 - 0.30141999999999824	99919.78	100007.11 - 47.17943999999897	True	14	False
+ """
 
 
 def test_long_to_short_reversal():
