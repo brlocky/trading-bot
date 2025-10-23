@@ -3,9 +3,6 @@ numpy==2.2.5
 pandas==2.2.3
 matplotlib==3.10.6
 plotly==6.3.0
-scikit-learn==1.7.2
-scipy==1.16.2
-seaborn==0.13.2
 
 # Technical Analysis
 TA-Lib==0.6.7
@@ -15,23 +12,5 @@ TA-Lib==0.6.7
 stable_baselines3==2.1.0
 gymnasium==0.29.1
 tqdm==4.67.1
-requests==2.32.3
-
-# Jupyter Notebook Support
-ipython==9.6.0
-ipywidgets==8.1.7
-jupyterlab_widgets==3.0.15
-widgetsnbextension==4.0.14
-
-# Image processing (for matplotlib)
-pillow==11.3.0
-
-# Performance computing (if needed)
-numba==0.62.1
-llvmlite==0.45.0
-
-# Configuration
-PyYAML==6.0.2
-
-# Model persistence
-joblib==1.5.2
+sb3_contrib==2.7.0
+tensorboard==2.20.0

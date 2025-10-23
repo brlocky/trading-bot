@@ -163,10 +163,8 @@ cython_debug/
 .vscode/
 
 # Data files (add specific patterns as needed)
-*.csv
-*.xlsx
-*.json
-*.parquet
+data/*.json
+models/
 
 # Model files
 *.pkl
