@@ -105,7 +105,7 @@ class DataLoader:
 
         return target_df
 
-    def load_data_with_indicators(self, symbol: str, timeframes: List[ChartInterval] = ['15m', '1h', 'D', 'W', 'M']) -> Dict[ChartInterval, pd.DataFrame]:
+    def load_data_with_indicators(self, symbol: str, timeframes: List[ChartInterval] = ['15m']) -> Dict[ChartInterval, pd.DataFrame]:
         """
         Enhanced data loading with multi-timeframe indicator configuration
         """
