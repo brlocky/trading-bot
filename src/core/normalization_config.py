@@ -56,7 +56,7 @@ def get_model_config():
         'use_sde': False,                  # Use State-Dependent Exploration (stable noise)
         'sde_sample_freq': -1,            # Resample SDE noise only once per rollout
 
-        'n_envs': 1,                      # Parallel environments for efficiency
+        'n_envs': 4,                      # Parallel environments for efficiency
 
         # Network architecture
         'hidden_layers_vf': [64, 64],        # Value function network depth
