@@ -24,6 +24,7 @@ class TradingBroker:
         # Trade size and direction
         self.signal = 0  # -1: short, 0: flat, 1: long
         self.position_shares = 0.0
+        self.unrealized_pnl = 0.0
         self.traded = False
 
         # Tracking
@@ -39,6 +40,7 @@ class TradingBroker:
         self.entry_price = 0.0
         self.last_price = 0.0
         self.total_trades = 0
+        self.unrealized_pnl = 0.0
         self.traded = False
         self.step_history.clear()
 
@@ -95,8 +97,9 @@ class TradingBroker:
                 realized_pnl = self._open_position(-share_size, price)
 
         self.last_price = price
-
+        self.signal = signal
         self.equity = self.calculate_portfolio_value(price)
+        self.unrealized_pnl = self.calculate_unrealized_pnl(price)
         self._record_step(step_index, price, signal, signal_power, step_pnl)
 
         return step_pnl, self.traded, False
@@ -269,6 +272,7 @@ class TradingBroker:
 
     def _create_step_record(self, step_index: int, price: float, signal: float, position_size: float, step_pnl: float):
         return {
+            'initial_balance': self.initial_balance,
             'step': step_index,
             'signal': signal,
             'position_size': position_size,
@@ -277,7 +281,7 @@ class TradingBroker:
             'position_shares': self.position_shares,
             'cash': self.cash,
             'cash_used': self.cash_used,
-            'unrealized_pnl': self.calculate_unrealized_pnl(price),
+            'unrealized_pnl': self.unrealized_pnl,
             'equity': self.equity,
             'step_pnl': step_pnl,
             'traded': self.traded,

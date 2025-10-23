@@ -5,18 +5,25 @@ Simple Model Testing Report for RL Trading Bot - KISS Implementation
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from src.core.normalization_config import get_default_environment_config
+from core.normalization_config import get_default_environment_config
 
 
 def create_simple_charts(results_df):
     """Create simple 5-panel trading visualization"""
 
-    # Create 5 subplots
+    # Create 6 subplots (add Reward panel)
     fig = make_subplots(
-        rows=5, cols=1,
+        rows=6, cols=1,
         shared_xaxes=True,
         vertical_spacing=0.05,
-        subplot_titles=['Price & Signals', 'Position Size (Input)', 'Position Shares (Held)', 'Balance', 'Step P&L']
+        subplot_titles=[
+            'Price & Signals',
+            'Position Size (Input)',
+            'Equity (Held)',
+            'Balance',
+            'Step P&L',
+            'Reward (clipped [-3, 3])'
+        ]
     )
 
     # Panel 1: Price and signals
@@ -98,51 +105,14 @@ def create_simple_charts(results_df):
         row=2, col=1
     )
 
-    # Panel 3: Position Shares (Held)
-    # Separate positive (long) and negative (short) positions
+    # Panel 3: Equity (Held)
     fig.add_trace(
         go.Scatter(
             x=results_df.index,
-            y=results_df['position_shares'],
+            y=results_df['equity'],
             mode='lines',
-            name='Position Shares',
-            line=dict(color='rgb(100, 100, 100)', width=2),
-            fill='tozeroy',
-            fillcolor='rgba(100, 100, 100, 0.3)'
-        ),
-        row=3, col=1
-    )
-
-    # Add green fill for long positions (positive)
-    long_shares = results_df['position_shares'].copy()
-    long_shares[long_shares < 0] = 0
-    fig.add_trace(
-        go.Scatter(
-            x=results_df.index,
-            y=long_shares,
-            mode='lines',
-            name='Long',
-            line=dict(color='rgb(0, 255, 0)', width=0),
-            fill='tozeroy',
-            fillcolor='rgba(0, 255, 0, 0.5)',
-            showlegend=False
-        ),
-        row=3, col=1
-    )
-
-    # Add red fill for short positions (negative)
-    short_shares = results_df['position_shares'].copy()
-    short_shares[short_shares > 0] = 0
-    fig.add_trace(
-        go.Scatter(
-            x=results_df.index,
-            y=short_shares,
-            mode='lines',
-            name='Short',
-            line=dict(color='rgb(255, 0, 0)', width=0),
-            fill='tozeroy',
-            fillcolor='rgba(255, 0, 0, 0.5)',
-            showlegend=False
+            name='Equity (Held)',
+            line=dict(color='rgb(0, 200, 0)', width=4)
         ),
         row=3, col=1
     )
@@ -208,8 +178,25 @@ def create_simple_charts(results_df):
         row=5, col=1
     )
 
+    # Panel 6: Reward (clipped)
+    clipped_reward = results_df['reward'] if 'reward' in results_df else None
+    if clipped_reward is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=results_df.index,
+                y=clipped_reward,
+                mode='lines',
+                name='Reward',
+                line=dict(color='rgb(0, 150, 255)', width=2),
+                fill='tozeroy',
+                fillcolor='rgba(0, 150, 255, 0.3)'
+            ),
+            row=6, col=1
+        )
+        fig.update_yaxes(title_text="Reward (clipped)", row=6, col=1, range=[-1, 1])
+
     # Update layout
-    fig.update_layout(title='Trading Model Results', height=1100)
+    fig.update_layout(title='Trading Model Results', height=1300)
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Position Size (Input)", row=2, col=1)
     fig.update_yaxes(title_text="Position Shares (Held)", row=3, col=1)
@@ -258,7 +245,7 @@ def quick_test_model(model_dir, symbol='BTCUSDT', test_candles=500):
         # Load data
         print("📊 Loading data...")
         loader = DataLoader()
-        dfs = loader.load_data(symbol)
+        dfs = loader.load_data_with_indicators(symbol)
         test_data = dfs['15m'].tail(test_candles)
 
         config = get_default_environment_config()

@@ -191,8 +191,8 @@ class FeatureNormalizer:
         self.normalizer_factory = {
             'price_ratio': lambda: PriceRatioNormalizer(),
             'price_baseline': lambda: IdentityNormalizer(),  # Close price always 0
-            'bounded_0_100': lambda: BoundedNormalizer((0, 100), (0, 1)),
-            'bounded_0_1': lambda: BoundedNormalizer((0, 1), (0, 1)),
+            'bounded_0_100': lambda: BoundedNormalizer((0, 100), (-1, 1)),
+            'bounded_0_1': lambda: BoundedNormalizer((0, 1), (-1, 1)),
             'oscillator': lambda: StandardNormalizer((-1, 1)),
             'volume_log': lambda: VolumeLogNormalizer(),
             'ratio': lambda: IdentityNormalizer(),

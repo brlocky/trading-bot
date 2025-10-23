@@ -29,7 +29,6 @@ Output:
 """
 
 import sys
-import pandas as pd
 import requests
 import json
 import time
@@ -326,24 +325,6 @@ class BinanceDataExtractor:
             symbol: Trading pair (e.g., 'BTCUSDT')
             interval: Timeframe in our format (e.g., 'W', 'D', '1h', '15m')
         """
-        from indicator_utils import add_indicators
-
-        print(f"   🔧 Adding technical indicators...", end='', flush=True)
-
-        df = pd.DataFrame(candles)
-
-        # Add technical indicators
-        try:
-            df = add_indicators(df, add_crossovers=True)
-
-            # Convert back to list of dictionaries
-            # Fill NaN values with None for JSON compatibility
-            candles = df.to_dict('records')
-            print(" ✅")
-
-        except Exception as e:
-            print(f" ⚠️  Error adding indicators: {e}")
-            print("   📊 Saving without indicators...")
 
         # Get start and end times from candles
         start_timestamp = candles[0]['time']

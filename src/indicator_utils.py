@@ -8,7 +8,7 @@ import numpy as np
 import talib
 
 
-def add_indicators(df: pd.DataFrame, add_crossovers: bool = True) -> pd.DataFrame:
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Add TA-Lib indicators and derived features to a price DataFrame.
 
     Parameters:
@@ -24,16 +24,10 @@ def add_indicators(df: pd.DataFrame, add_crossovers: bool = True) -> pd.DataFram
     df['rsi'] = talib.RSI(close, timeperiod=14)
 
     # === MACD ===
-    macd, macd_signal, macd_history = talib.MACD(close)
-    df['macd'] = macd
-    df['macd_signal'] = macd_signal
-    df['macd_hist'] = macd_history
+    df['macd'], df['macd_signal'], df['macd_hist'] = talib.MACD(close, 12, 26, 9)
 
     # === Bollinger Bands ===
-    bb_upper, bb_middle, bb_lower = talib.BBANDS(close, timeperiod=20)
-    df['bb_upper'] = bb_upper
-    df['bb_lower'] = bb_lower
-    df['bb_middle'] = bb_middle
+    df['bb_upper'], df['bb_middle'], df['bb_lower'] = talib.BBANDS(close, 20, 2, 2)
 
     # === Volume-based ===
     df['volume_ma20'] = talib.SMA(volume, timeperiod=20)
@@ -50,21 +44,14 @@ def add_indicators(df: pd.DataFrame, add_crossovers: bool = True) -> pd.DataFram
     for p in ema_periods:
         df[f'ema{p}'] = talib.EMA(close, timeperiod=p)
 
-    # === EMA crossovers (optional) ===
-    if add_crossovers:
-        df['ema9_ema21_cross'] = (df['ema9'] > df['ema21']).astype(int)
-        df['ema20_ema50_cross'] = (df['ema20'] > df['ema50']).astype(int)
-
     # === Stochastic ===
     stoch_k, stoch_d = talib.STOCH(high, low, close, fastk_period=5, slowk_period=3, slowd_period=3)
     df['stochastic_k'] = stoch_k
     df['stochastic_d'] = stoch_d
     # === VWAP (reset daily) ===
-    # Convert Unix timestamps (seconds) to datetime
-    df['time'] = pd.to_datetime(df['time'], unit='s')
 
     # Now daily reset works
-    days = df['time'].dt.floor('D')
+    days = df['date'].dt.floor('D')
 
     # Compute cumulative sums per day
     cum_vol = df.groupby(days)['volume'].cumsum()

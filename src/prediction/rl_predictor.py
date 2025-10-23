@@ -2,20 +2,20 @@
 Reinforcement Learning Predictor - Minimal RL trading agent using PPO
 """
 
-from typing import Optional, Union
+from typing import Optional
+import numpy as np
 import pandas as pd
 import os
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.logger import configure, Logger
+from stable_baselines3.common.logger import configure
 
 
 import torch
 from data_processing.feature_normalizer import FeatureNormalizer
 from environments.trading_environment import TradingEnvironment
 from core.normalization_config import (
-    get_features_list,
     get_default_environment_config,
     get_model_config,
 )
@@ -33,7 +33,6 @@ class RLPredictor:
         self.normalizer: Optional[FeatureNormalizer] = None
 
         # Get default configurations
-        self.feature_list = get_features_list()
         self.env_config = get_default_environment_config()
         self.train_config = get_model_config()
 
@@ -59,7 +58,7 @@ class RLPredictor:
             print("⚠️ GPU not available, using CPU (training will be slower)")
         return device
 
-    def get_model_config(self) -> dict:
+    def get_env_config(self) -> dict:
         return {
             'window_size': self.train_config.get('window_size'),
             'initial_balance': self.env_config.get('initial_balance'),
@@ -67,26 +66,26 @@ class RLPredictor:
             'sell_threshold': self.env_config.get('sell_threshold'),
         }
 
-    def _create_vectorized_env(self, df: pd.DataFrame, normalizer: FeatureNormalizer, n_envs=1, use_log=False) -> DummyVecEnv:
-        """
-        Helper method to create a vectorized environment with configurable number of parallel environments
+    def load_model(self, env: Optional[TradingEnvironment]) -> RecurrentPPO:
+        try:
+            """Load the trained model with proper device handling"""
+            path = os.path.join(self.model_dir, 'ppo_trading.zip')
+            # Load model with device specification
+            if env:
+                model = RecurrentPPO.load(path, device=self.device, env=env)
+            else:
+                model = RecurrentPPO.load(path, device=self.device)
+            print(f"✅ Model loaded on {self.device}")
+            return model
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model: {e}")
 
-        Args:
-            df: Training dataframe
-            normalizer: Fitted feature normalizer
-            log_dir: Directory for Monitor logs (optional)
-
-        Returns:
-            DummyVecEnv with configured number of parallel environments
-        """
-
+    def _create_vectorized_env(self, df: pd.DataFrame, n_envs=1, use_log=False) -> DummyVecEnv:
         def make_env(env_id: int):
             def _init():
                 env = TradingEnvironment(
                     df=df,
-                    normalizer=normalizer,
-                    feature_config=self.feature_list,
-                    **self.get_model_config()
+                    **self.get_env_config()
                 )
                 if use_log:
                     monitor_filename = os.path.join(self.log_dir, f"monitor_env_{env_id}.csv")
@@ -100,18 +99,17 @@ class RLPredictor:
 
         return DummyVecEnv(env_fns)
 
-    def get_model_and_normalizer(self,
-                                 df: pd.DataFrame,
-                                 continue_training: bool = False,
-                                 n_envs: int = 1
-                                 ) -> tuple[RecurrentPPO, FeatureNormalizer]:
+    def get_model(self,
+                  df: pd.DataFrame,
+                  continue_training: bool = False,
+                  n_envs: int = 1
+                  ) -> RecurrentPPO:
         # Load existing model if continue_training=True, else create new
         if continue_training:
             print("🔄 Loading existing model...")
-            normalizer = self.load_normalizer()
             ppo_model = self.load_model(None)
             print(f"✅ Loaded model with {ppo_model.num_timesteps:,} timesteps")
-            return ppo_model, normalizer
+            return ppo_model
 
         print("🆕 Creating new model...")
         # Configure PPO with settings from configuration
@@ -121,30 +119,32 @@ class RLPredictor:
                 vf=self.train_config['hidden_layers_vf']     # [256, 256]
             ),
             "lstm_hidden_size": self.train_config['lstm_hidden_size'],  # 256
+            "n_lstm_layers": self.train_config['lstm_num_layers'],  # 1
             "activation_fn": getattr(torch.nn, self.train_config['activation_function']),  # Remove ()
             "ortho_init": self.train_config['ortho_init']
         }
 
-        normalizer = FeatureNormalizer(self.feature_list)
-        df = df[self.feature_list.keys()].ffill().bfill().dropna()
-
-        normalizer.fit(df, close_prices=df['close'])
-        # Save the normalizer
-        self.save_normalizer(normalizer)
-
         # Create dummy vectorized environment for model initialization
-        dummy_vec_env = self._create_vectorized_env(df, normalizer, n_envs)
+        dummy_vec_env = self._create_vectorized_env(df, n_envs)
 
+        n_steps = self.train_config.get('n_steps', 1)
+
+        # sanity check: batch_size must divide (n_steps * n_envs)
         batch_size = (self.train_config['batch_size_gpu'] if self.device == 'cuda'
                       else self.train_config.get('batch_size_cpu', self.train_config['batch_size_gpu']))
+
+        collected = n_steps * n_envs
+        if collected % batch_size != 0:
+            raise ValueError(f"batch_size ({batch_size}) must divide n_steps * n_envs ({collected})")
+
         dummy_vec_env.close()
 
         ppo_model = RecurrentPPO(
-            policy='MlpLstmPolicy',        # LSTM policy
+            policy='MultiInputLstmPolicy',        # LSTM policy
             env=dummy_vec_env,
             device=self.device,            # Add device parameter
             learning_rate=self.train_config['learning_rate'],
-            n_steps=self.train_config['n_steps'],
+            n_steps=n_steps,
             batch_size=batch_size,
             n_epochs=self.train_config['n_epochs'],
             gamma=self.train_config['gamma'],
@@ -165,11 +165,10 @@ class RLPredictor:
             use_sde=self.train_config['use_sde'],
             sde_sample_freq=self.train_config['sde_sample_freq'],
             policy_kwargs=policy_kwargs,
-            verbose=1,
-
+            verbose=2,
         )
 
-        return ppo_model, normalizer
+        return ppo_model
 
     def train(self, train_df: pd.DataFrame, continue_training: bool = False, verbose: int = 0, **kwargs):
         """
@@ -187,12 +186,12 @@ class RLPredictor:
         n_envs = self.train_config.get('n_envs', 4)
 
         print(f"🚀 Initializing PPO model on {self.device}...")
-        self.model, self.normalizer = self.get_model_and_normalizer(df=train_df, continue_training=continue_training, n_envs=n_envs)
+        self.model = self.get_model(df=train_df, continue_training=continue_training, n_envs=n_envs)
 
-        if not self.model or not self.normalizer:
-            raise RuntimeError("Failed to initialize model or normalizer")
+        if not self.model:
+            raise RuntimeError("Failed to initialize model for training")
 
-        train_env = self._create_vectorized_env(train_df, self.normalizer, n_envs, True)
+        train_env = self._create_vectorized_env(train_df, n_envs, True)
 
         print(f"📊 Training with {n_envs} parallel environments")
         print(f"📊 Monitor logs will be saved to: {self.log_dir}")
@@ -245,35 +244,35 @@ class RLPredictor:
 
         return training_successful  # Indicate successful training
 
-    def load_model(self, env: Optional[TradingEnvironment]) -> RecurrentPPO:
-        try:
-            """Load the trained model with proper device handling"""
-            path = os.path.join(self.model_dir, 'ppo_trading.zip')
-            # Load model with device specification
-            if env:
-                model = RecurrentPPO.load(path, device=self.device, env=env)
-            else:
-                model = RecurrentPPO.load(path, device=self.device)
-            print(f"✅ Model loaded on {self.device}")
-            return model
-        except Exception as e:
-            raise RuntimeError(f"Failed to load model: {e}")
+    def _prepare_obs_for_model(self, obs):
+        """
+        Normalize observation to the shape expected by recurrent policies:
+         - If obs is a dict: ensure each value is shaped (batch, window, features)
+         - If obs is an ndarray: ensure shape is (batch, window, features)
+        Repeats a 1D feature vector across the time window when needed.
+        """
+        window = int(self.train_config.get('window_size', 96))
 
-    def save_normalizer(self, normalizer: FeatureNormalizer, filename: str = 'normalizer.pkl'):
-        """Save the fitted normalizer"""
-        if not normalizer.is_fitted:
-            raise ValueError("Cannot save an unfitted normalizer")
-        normalizer_path = os.path.join(self.model_dir, filename)
-        normalizer.save(normalizer_path)
+        # dict path
+        if isinstance(obs, dict):
+            prepared = {}
+            for k, v in obs.items():
+                arr = np.asarray(v)
+                if arr.ndim == 1:
+                    # repeat feature vector across time window
+                    features = arr.shape[0]
+                    tiled = np.tile(arr.reshape(1, -1), (window, 1))  # (window, features)
+                    prepared[k] = tiled.reshape(1, window, features)
+                elif arr.ndim == 2:
+                    # assume (window, features) -> add batch dim
+                    prepared[k] = arr.reshape(1, arr.shape[0], arr.shape[1])
+                elif arr.ndim == 3:
+                    prepared[k] = arr
+                else:
+                    raise ValueError(f"Unsupported dict observation array shape for key '{k}': {arr.shape}")
+            return prepared
 
-    def load_normalizer(self, filename: str = 'normalizer.pkl') -> FeatureNormalizer:
-        """Load a previously saved normalizer"""
-        try:
-            normalizer_path = os.path.join(self.model_dir, filename)
-            print(f"📥 Loaded normalizer from: {normalizer_path}")
-            return FeatureNormalizer.load(normalizer_path)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load normalizer: {e}")
+        raise ValueError(f"Cannot prepare observation of type {type(obs)}")
 
     def generate_predictions(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -287,45 +286,47 @@ class RLPredictor:
         """
         print(f"🎯 Generating predictions for {len(df)} candles...")
 
-        self.normalizer = self.load_normalizer()
-
         # Create environment for predictions
-        env = TradingEnvironment(df, **self.get_model_config(), feature_config=self.feature_list, normalizer=self.normalizer)
+        env = TradingEnvironment(df, **self.get_env_config())
 
         # Load model with environment
         self.model = self.load_model(env)  # need to load the env on the load because it diff from the 8 on the training
 
         # Generate predictions
-        obs, _ = env.reset()
+        obs_raw, _ = env.reset()
 
         last_state = None
         while True:
             try:
+                obs_prepared = self._prepare_obs_for_model(obs_raw)
                 # Get model action - wrap in try/catch to catch internal NaN errors
-                action, _states = self.model.predict(obs, last_state, deterministic=True)
+                action, _states = self.model.predict(obs_prepared, last_state, deterministic=True)
                 last_state = _states
+
+                # Handle Box action space: [signal, position_size]
+                # Extract signal and position size from Box action
+                action = np.array(action).reshape(-1)  # ensures flat [signal, size]
+                raw_signal, raw_position_size = action[0], action[1]
+
+                # raw_signal = np.random.choice([-1, 0, 1])
+                # raw_position_size = 0.5
+
+                # Convert continuous signal to discrete: -1, 0, 1
+                # Use more sensitive thresholds to allow trading
+                if raw_signal > self.env_config['buy_threshold']:  # Lower threshold for BUY
+                    signal = 1  # BUY
+                elif raw_signal < self.env_config['sell_threshold']:  # Lower threshold for SELL
+                    signal = -1  # SELL
+                else:
+                    signal = 0  # HOLD
+
+                # Step environment to get next observation
+                obs_raw, reward, done, truncated, info = env.step([signal, raw_position_size])
+
+                if done or truncated:
+                    break
             except ValueError as e:
                 raise e
-
-            # Handle Box action space: [signal, position_size]
-            # Extract signal and position size from Box action
-            raw_signal = float(action[0])  # Range: -1.0 to 1.0
-            raw_position_size = float(action[1])  # Range: 0.0 to 1.0
-
-            # Convert continuous signal to discrete: -1, 0, 1
-            # Use more sensitive thresholds to allow trading
-            if raw_signal > self.env_config['buy_threshold']:  # Lower threshold for BUY
-                signal = 1  # BUY
-            elif raw_signal < self.env_config['sell_threshold']:  # Lower threshold for SELL
-                signal = -1  # SELL
-            else:
-                signal = 0  # HOLD
-
-            # Step environment to get next observation
-            obs, reward, done, truncated, info = env.step([signal, raw_position_size])
-
-            if done or truncated:
-                break
 
         # Create results DataFrame
         if len(env.step_history) == 0:

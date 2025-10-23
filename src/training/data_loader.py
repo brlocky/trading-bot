@@ -3,8 +3,7 @@ from pathlib import Path
 from typing import Dict, List
 import pandas as pd
 from core.trading_types import ChartInterval
-from core.normalization_config import get_features_list
-from src.indicator_utils import add_indicators
+from indicator_utils import add_indicators
 
 
 class DataLoader:
@@ -106,13 +105,34 @@ class DataLoader:
 
         return target_df
 
-    def load_data(self,
-                  symbol: str,
-                  timeframes: List[ChartInterval] = ['15m', '1h', 'D', 'W', 'M'],
-                  target_tf: ChartInterval = '15m') -> Dict[ChartInterval, pd.DataFrame]:
+    def load_data_with_indicators(self, symbol: str, timeframes: List[ChartInterval] = ['15m', '1h', 'D', 'W', 'M']) -> Dict[ChartInterval, pd.DataFrame]:
         """
         Enhanced data loading with multi-timeframe indicator configuration
         """
+        try:
+            print(f"📥 Loading data for {symbol}...")            # Step 1: Load candle data for all timeframes
+            candle_files = self._build_candle_file_config(symbol, timeframes)
+            dfs = self._load_files(candle_files)
+
+            print(" - Adding indicators...")
+            [add_indicators(dfs[tf]) for tf in timeframes]
+
+            print(" - Dropping NaNs for...")
+            # Drop rows with NaNs caused by indicators
+            for tf in timeframes:
+                dfs[tf] = dfs[tf].dropna().reset_index(drop=True)
+
+            print("Data loading complete.")
+            return dfs
+
+        except Exception as e:
+            raise RuntimeError(f"❌ Error loading data for {symbol}: {str(e)}")
+
+    """ def load_data(self,
+                  symbol: str,
+                  timeframes: List[ChartInterval] = ['15m', '1h', 'D', 'W', 'M'],
+                  target_tf: ChartInterval = '15m') -> Dict[ChartInterval, pd.DataFrame]:
+
         try:
             print(f"📥 Loading data for {symbol}...")            # Step 1: Load candle data for all timeframes
             candle_files = self._build_candle_file_config(symbol, timeframes)
@@ -128,7 +148,7 @@ class DataLoader:
             # Merge levels with target timeframe candle data
             target_df = dfs[target_tf]
 
-            [add_indicators(dfs[tf], add_crossovers=True) for tf in timeframes]
+            [add_indicators(dfs[tf]) for tf in timeframes]
 
             # Align indices
             target_df = target_df.reindex(target_df.index)
@@ -200,7 +220,7 @@ class DataLoader:
             return dfs
 
         except Exception as e:
-            raise RuntimeError(f"❌ Error loading data for {symbol}: {str(e)}")
+            raise RuntimeError(f"❌ Error loading data for {symbol}: {str(e)}") """
 
     def _load_files(self, file_config: Dict[ChartInterval, str]) -> Dict[ChartInterval, pd.DataFrame]:
         """
@@ -225,6 +245,7 @@ class DataLoader:
 
                 # Convert timestamp to datetime and set as index
                 df['datetime'] = pd.to_datetime(df['time'], unit='s')
+                df['date'] = pd.to_datetime(df['time'], unit='s')
                 df.set_index('datetime', inplace=True)
                 result[tf] = df
 
