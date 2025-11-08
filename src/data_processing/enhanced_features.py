@@ -46,7 +46,7 @@ def precompute_momentum_features() -> list[str]:
 
 
 def precompute_rsi_features() -> list[str]:
-    return ['rsi']
+    return ['rsi', 'high', 'low']
 
 
 def precompute_macd_features(df: pd.DataFrame) -> list[str]:
@@ -55,7 +55,7 @@ def precompute_macd_features(df: pd.DataFrame) -> list[str]:
     df['macd_norm'] = df['macd'] / df['close']
     df['macd_signal_norm'] = df['macd_signal'] / df['close']
     df['macd_hist_norm'] = df['macd_hist'] / df['close']
-    return ['macd_norm', 'macd_signal_norm', 'macd_hist_norm']
+    return ['macd_norm', 'macd_signal_norm', 'macd_hist_norm', 'high', 'low']
 
 
 def precompute_price_context_features(df: pd.DataFrame) -> list[str]:

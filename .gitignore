@@ -163,8 +163,11 @@ cython_debug/
 .vscode/
 
 # Data files (add specific patterns as needed)
-data/*.json
+data/
+data_simple/
 models/
+logs/
+tensorboard_logs/
 
 # Model files
 *.pkl
@@ -174,3 +177,4 @@ models/
 
 # Log files
 *.log
+
