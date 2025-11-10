@@ -59,7 +59,11 @@ class SimpleTradingEnv(gym.Env):
     Total: 134 features + 50 VP bins = 184 features
     """
 
-    def __init__(self, data, initial_balance=10000, lookback_window=288, n_bins=50, device="cuda", render_mode='human'):
+    def __init__(
+        self, data, initial_balance=10000, lookback_window=288,
+        n_bins=50, device="cuda", render_mode='human',
+        enable_pattern_memory=True, reward_min=-200.0, reward_max=400.0
+    ):
         super().__init__()
 
         self.lookback_window = lookback_window
@@ -74,7 +78,20 @@ class SimpleTradingEnv(gym.Env):
         add_indicators(self.data)
         self.data = self.data.dropna().reset_index(drop=True)
 
-        # Prepare data with all features - pre-compute all static features (modifies in place)
+        # Reward normalization bounds (min-max scaling to [-1, 1])
+        self.reward_min = reward_min
+        self.reward_max = reward_max
+        self.reward_range_size = reward_max - reward_min
+
+        # Initialize pattern memory
+        self.enable_pattern_memory = enable_pattern_memory
+        if enable_pattern_memory:
+            from environments.trading_pattern_memory import TradingPatternMemory
+            self.pattern_memory = TradingPatternMemory()
+
+        # Track current episode
+        self.episode_transitions = []
+        self.episode_return = 0.0        # Prepare data with all features - pre-compute all static features (modifies in place)
         self.price_spatial_cols = precompute_spatial_price_normalized_features(self.data)
         self.price_temporal_cols = precompute_temporal_price_normalized_features(self.data, window=lookback_window)
         self.price_context_cols = precompute_price_context_features(self.data, window=lookback_window)
@@ -142,6 +159,16 @@ class SimpleTradingEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
+
+        # Save previous episode if it exists
+        if self.enable_pattern_memory and len(self.episode_transitions) > 0:
+            episode_data = self._create_episode_summary()
+            self.pattern_memory.add_episode(episode_data)
+
+        # Reset episode tracking
+        self.episode_transitions = []
+        self.episode_return = 0.0
+
         self.current_step = self.lookback_window
         self.history = []
         self.broker.reset()
@@ -166,14 +193,14 @@ class SimpleTradingEnv(gym.Env):
             })
 
             # Update volume profile with initial data
-            self.vp.update(
+            """ self.vp.update(
                 self.data['date'].iloc[i],
                 self.data['open'].iloc[i],
                 self.data['high'].iloc[i],
                 self.data['low'].iloc[i],
                 self.data['close'].iloc[i],
                 self.data['volume'].iloc[i]
-            )
+            ) """
 
         return self._get_obs(), {}
 
@@ -217,10 +244,23 @@ class SimpleTradingEnv(gym.Env):
 
         reward = self.calculate_reward(direction_action, current_state, previous_state)
 
-        done = False
-        truncated = False
+        # Normalize reward using min-max scaling to [-1, 1]
+        raw_reward = reward
+        reward = self._normalize_reward_minmax(reward)
 
-        # More lenient bankruptcy check - only stop if truly bankrupt (< 5% of initial)
+        # Track transition for pattern memory
+        if self.enable_pattern_memory:
+            self.episode_transitions.append({
+                'step': self.current_step,
+                'action': action,
+                'reward': reward,           # Normalized reward
+                'raw_reward': raw_reward,   # Keep raw for analysis
+                'info': current_state.copy()
+            })
+            self.episode_return += reward
+
+        done = False
+        truncated = False        # More lenient bankruptcy check - only stop if truly bankrupt (< 5% of initial)
         if self.broker.is_bankrupt:
             print("Account bankrupt!")
             done = True
@@ -238,7 +278,14 @@ class SimpleTradingEnv(gym.Env):
         self.current_step += 1
         truncated = self.current_step >= len(self.data) - 1 if truncated is False else truncated
 
-        if not truncated:
+        # If episode ends, save it
+        if (done or truncated) and self.enable_pattern_memory and len(self.episode_transitions) > 0:
+            episode_data = self._create_episode_summary()
+            self.pattern_memory.add_episode(episode_data)
+            self.episode_transitions = []
+            self.episode_return = 0.0
+
+        """ if not truncated:
             new_date = self.data['date'].iloc[self.current_step]
             new_open = self.data['open'].iloc[self.current_step]
             new_high = self.data['high'].iloc[self.current_step]
@@ -254,7 +301,7 @@ class SimpleTradingEnv(gym.Env):
             new_close = self.data['close'].iloc[self.current_step-1]
             new_vol = self.data['volume'].iloc[self.current_step-1]
 
-        self.vp.update(new_date, new_open, new_high, new_low, new_close, new_vol)
+        self.vp.update(new_date, new_open, new_high, new_low, new_close, new_vol) """
         obs = self._get_obs()
         return obs, reward, done, truncated, self.history[-1]
 
@@ -361,6 +408,35 @@ class SimpleTradingEnv(gym.Env):
             obs_dict[key] = tensor.cpu().numpy().astype(np.float32)
 
         return obs_dict
+
+    def _normalize_reward_minmax(self, reward):
+        """
+        Normalize reward to [-1, 1] using symmetric scaling around zero
+
+        This ensures 0 reward → 0 normalized (centered)
+        Positive rewards → [0, 1]
+        Negative rewards → [-1, 0]
+
+        Args:
+            reward: Raw reward value
+
+        Returns:
+            Normalized reward in [-1, 1] range
+        """
+        # Handle edge case
+        if reward == 0:
+            return 0.0
+
+        # Normalize positive and negative rewards separately (symmetric around 0)
+        if reward > 0:
+            # Positive: scale [0, reward_max] → [0, 1]
+            normalized = reward / self.reward_max
+        else:
+            # Negative: scale [reward_min, 0] → [-1, 0]
+            normalized = reward / abs(self.reward_min)
+
+        # Clip to ensure bounds (handles extreme outliers)
+        return float(np.clip(normalized, -1.0, 1.0))
 
     def calculate_reward(self, direction, current_state, previous_state):
         """
@@ -488,6 +564,29 @@ class SimpleTradingEnv(gym.Env):
 
         # Clip to prevent extreme values
         return float(np.clip(reward, -500.0, 500.0))
+
+    def _create_episode_summary(self):
+        """Create summary of episode for pattern memory"""
+        trades = [t for t in self.broker.step_history if t.get('status') == 'CLOSED']
+        winning_trades = [t for t in trades if t.get('pnl_percent', 0) > 0]
+
+        # Calculate market conditions from recent data
+        recent_window = 20
+        end_idx = min(self.current_step, len(self.data) - 1)
+        start_idx = max(0, end_idx - recent_window)
+
+        return {
+            'transitions': self.episode_transitions.copy(),
+            'total_return': self.episode_return,
+            'total_trades': len(trades),
+            'win_rate': len(winning_trades) / len(trades) if trades else 0.0,
+            'final_balance': self.broker.get_state()['current_balance'],
+            'episode_length': len(self.episode_transitions),
+            'market_conditions': {
+                'volatility': float(self.data['close'].iloc[start_idx:end_idx].std()),
+                'avg_volume': float(self.data['volume'].iloc[start_idx:end_idx].mean()),
+            }
+        }
 
     def render(self):
         visualizer = GenericTradingVisualizer(subplot_config=create_advanced_config())
