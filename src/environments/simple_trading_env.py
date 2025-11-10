@@ -62,7 +62,7 @@ class SimpleTradingEnv(gym.Env):
     def __init__(
         self, data, initial_balance=10000, lookback_window=288,
         n_bins=50, device="cuda", render_mode='human',
-        enable_pattern_memory=True, reward_min=-200.0, reward_max=400.0
+        enable_pattern_memory=True, reward_min=-200.0, reward_max=200.0
     ):
         super().__init__()
 
