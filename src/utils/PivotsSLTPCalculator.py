@@ -50,8 +50,8 @@ class PivotSLTPCalculator:
         else:  # SHORT
             sl_price = entry_price + (current_atr * atr_multiplier)
 
-        # Ensure minimum risk of 0.3% of entry price (safety check, reduced from 0.5%)
-        """ min_risk = entry_price * 0.003
+        # Ensure minimum risk of 0.5% of entry price (safety check, reduced from 0.5%)
+        min_risk = entry_price * 0.005
         current_risk = abs(entry_price - sl_price)
 
         if current_risk < min_risk:
@@ -59,7 +59,7 @@ class PivotSLTPCalculator:
             if direction == 1:
                 sl_price = entry_price - min_risk
             else:
-                sl_price = entry_price + min_risk """
+                sl_price = entry_price + min_risk
 
         # Calculate risk distance AFTER adjustment
         risk = abs(entry_price - sl_price)

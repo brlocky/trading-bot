@@ -1,24 +1,23 @@
 """
-SimpleTradingEnv - Multi-Input Trading Environment (Phase 2: Divergence Detection + Cumulative VP)
+SimpleTradingEnv - Multi-Input Trading Environment (Optimized Architecture)
 
-Uses 14 feature groups with specialized CNNs for divergence detection and multi-scale volume analysis:
+Uses 6 feature groups with semantic separation for optimal learning:
 
-1. Spatial OHLC (4): Raw OHLC for Conv2d candlestick pattern detection
-2. Temporal OHLC (4): Raw OHLC for Conv1d trend evolution detection
-3. RSI Divergence (2): RSI, RSI_9 for divergence pattern detection via CNN
-4. MACD Divergence (3): MACD, Signal, Histogram for divergence detection via CNN
-5. Price Context (12): Time + candle structure + volume + spatial distances to EMAs/VWAP
-6. Trend Indicators (10): EMA slopes + crossovers + price momentum
-7. Momentum Oscillators (2): Stochastic K/D (RSI/MACD moved to dedicated CNNs)
-8. Volume Profile (26): Summarized VP features (distances to levels, value area position, etc.)
-9. Trading Sessions (3): ASIA, LONDON, NY open flags
-10. Account State (4): Balance, equity, margin, total trades
-11. Position Info (7): Position status, size, PnL, entry/TP/SL distances
-12. Performance Metrics (7): Win rate, avg win/loss, profit factor, drawdown, sharpe, ROI
-13. Daily VP Distribution (54): 50-bin rolling window volume histogram + VAH/VAL/POC/Close markers
-14. Cumulative VP Distribution (54): 50-bin cumulative volume histogram + VAH/VAL/POC/Close markers
+1. Price Patterns (8): Candle structure, volume, multi-TF returns [CNN]
+   - Temporal sequences processed by Conv1d for pattern detection
+2. Market Context (6): EMA/VWAP distances, volatility [MLP]
+   - Current market positioning (last timestep only)
+3. Trend Indicators (10): EMA slopes, crossovers, momentum [MLP]
+   - Current trend state (last timestep only)
+4. Trading Sessions (3): Asia/London/NY flags [Linear]
+   - Current session (last timestep only)
+5. Account State (5): Balance, equity, PnL, commission [MLP]
+   - Current account metrics
+6. Position Info (7): Status, leverage, distances, risk-reward [MLP]
+   - Current position state
 
-Total: 134 features per timestep + 54 daily VP bins + 54 cumulative VP bins = 242 features
+Total: 39 features per timestep
+Architecture: 1 CNN encoder + 5 MLP/Linear encoders -> 256-dim fused features
 
 Action Space: MultiDiscrete([4, 10, 10]) - [Direction, Risk-Reward Ratio, ATR Multiplier]
 """
@@ -34,16 +33,9 @@ from features.enhanced_volume_profile import EnhancedVolumeProfile
 from data_processing.enhanced_features import (
     get_account_state_features,
     get_position_info_features,
-    get_volume_profile_features,
-    get_volume_profile_bins,
-    precompute_price_context_features,
-    precompute_spatial_price_normalized_features,
-    precompute_temporal_price_normalized_features,
+    precompute_price_patterns_features,
+    precompute_market_context_features,
     precompute_trend_features,
-    precompute_momentum_features,
-    precompute_rsi_features,
-    precompute_rsi_divergence_features,
-    precompute_macd_features,
     precompute_trading_sessions
 )
 from utils.PivotsSLTPCalculator import PivotSLTPCalculator
@@ -91,42 +83,30 @@ class SimpleTradingEnv(gym.Env):
 
         # Track current episode
         self.episode_transitions = []
-        self.episode_return = 0.0        # Prepare data with all features - pre-compute all static features (modifies in place)
-        self.price_spatial_cols = precompute_spatial_price_normalized_features(self.data)
-        self.price_temporal_cols = precompute_temporal_price_normalized_features(self.data, window=lookback_window)
-        self.price_context_cols = precompute_price_context_features(self.data, window=lookback_window)
+        self.episode_return = 0.0
+
+        # Prepare data with all features - pre-compute all static features (modifies in place)
+        self.price_patterns_cols = precompute_price_patterns_features(self.data, window=lookback_window)
+        self.market_context_cols = precompute_market_context_features(self.data, window=lookback_window)
         self.trend_feature_cols = precompute_trend_features(self.data)
-        self.momentum_feature_cols = precompute_momentum_features(self.data)
-        self.rsi_feature_cols = precompute_rsi_features(self.data)
-        self.rsi_divergence_cols = precompute_rsi_divergence_features(self.data, window=lookback_window)
-        self.macd_feature_cols = precompute_macd_features(self.data, window=lookback_window)
         self.trading_session_cols = precompute_trading_sessions(self.data)
 
         # Action space: [direction, risk_reward_ratio, atr_multiplier]
         # - direction: 0=HOLD, 1=LONG, 2=SHORT, 3=CLOSE
         # - risk_reward_ratio: 0-9 (maps to 1.0x-10.0x)
         # - atr_multiplier: 0-9 (maps to 1.0-2.8)
-        self.action_space = MultiDiscrete([4, 10, 10])
+        # self.action_space = MultiDiscrete([4, 10, 10])
+        self.action_space = MultiDiscrete([4])
 
         self.observation_space = gym.spaces.Dict({
-            'price_ohlc_spatial': gym.spaces.Box(
+            'price_patterns': gym.spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(lookback_window, 4),
+                shape=(lookback_window, len(self.price_patterns_cols)),
                 dtype=np.float32
             ),
-            'price_ohlc_temporal': gym.spaces.Box(
+            'market_context': gym.spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(lookback_window, 4),
-                dtype=np.float32
-            ),
-            'rsi_divergence': gym.spaces.Box(
-                low=-np.inf, high=np.inf,
-                shape=(lookback_window, len(self.rsi_divergence_cols)),
-                dtype=np.float32
-            ),
-            'price_context': gym.spaces.Box(
-                low=-np.inf, high=np.inf,
-                shape=(lookback_window, len(self.price_context_cols)),
+                shape=(lookback_window, len(self.market_context_cols)),
                 dtype=np.float32
             ),
             'trend_indicators': gym.spaces.Box(
@@ -192,24 +172,17 @@ class SimpleTradingEnv(gym.Env):
                 **self.broker.get_state()
             })
 
-            # Update volume profile with initial data
-            """ self.vp.update(
-                self.data['date'].iloc[i],
-                self.data['open'].iloc[i],
-                self.data['high'].iloc[i],
-                self.data['low'].iloc[i],
-                self.data['close'].iloc[i],
-                self.data['volume'].iloc[i]
-            ) """
-
         return self._get_obs(), {}
 
     def step(self, action):
 
         # Unpack action: [direction, risk_reward_idx, atr_idx]
-        direction_action, rr_idx, atr_idx = int(action[0]), int(action[1]), int(action[2])
-        risk_reward_ratio = 1.0 + (rr_idx * 1.0)  # Maps 0-9 to 1.0-10.0
-        atr_multiplier = 2.0 + (atr_idx * 0.3)    # Maps 0-9 to 2.0-4.7 (wider SL)
+        # direction_action, rr_idx, atr_idx = int(action[0]), int(action[1]), int(action[2])
+        # risk_reward_ratio = 1.0 + (rr_idx * 1.0)  # Maps 0-9 to 1.0-10.0
+        # tr_multiplier = 2.0 + (atr_idx * 0.3)    # Maps 0-9 to 2.0-4.7 (wider SL)
+        direction_action = int(action[0])
+        risk_reward_ratio = 5
+        atr_multiplier = 2
 
         # Convert to actual prices
         current_price = self.data['close'].iloc[self.current_step].item()
@@ -285,30 +258,20 @@ class SimpleTradingEnv(gym.Env):
             self.episode_transitions = []
             self.episode_return = 0.0
 
-        """ if not truncated:
-            new_date = self.data['date'].iloc[self.current_step]
-            new_open = self.data['open'].iloc[self.current_step]
-            new_high = self.data['high'].iloc[self.current_step]
-            new_low = self.data['low'].iloc[self.current_step]
-            new_close = self.data['close'].iloc[self.current_step]
-            new_vol = self.data['volume'].iloc[self.current_step]
-
-        else:
-            new_date = self.data['date'].iloc[self.current_step-1]
-            new_open = self.data['open'].iloc[self.current_step-1]
-            new_high = self.data['high'].iloc[self.current_step-1]
-            new_low = self.data['low'].iloc[self.current_step-1]
-            new_close = self.data['close'].iloc[self.current_step-1]
-            new_vol = self.data['volume'].iloc[self.current_step-1]
-
-        self.vp.update(new_date, new_open, new_high, new_low, new_close, new_vol) """
         obs = self._get_obs()
         return obs, reward, done, truncated, self.history[-1]
 
     def _get_obs(self):
         """
-        Generate multi-input observation with 13 feature groups.
-        Includes dual OHLC perspectives (spatial + temporal CNNs), RSI/MACD divergence CNNs, and 100-bin VP distribution.
+        Generate multi-input observation with 6 feature groups.
+
+        Groups:
+        1. Price Patterns (8): Temporal sequences for CNN
+        2. Market Context (6): Current positioning (last timestep)
+        3. Trend Indicators (10): Current trend state (last timestep)
+        4. Trading Sessions (3): Current session (last timestep)
+        5. Account State (5): Current account metrics
+        6. Position Info (7): Current position state
         """
         start_idx = max(0, self.current_step - self.lookback_window)
         end_idx = self.current_step
@@ -316,55 +279,30 @@ class SimpleTradingEnv(gym.Env):
         # Get data slice
         df_slice = self.data.iloc[start_idx:end_idx].copy()
 
-        # === Group 1: Spatial OHLC (Conv2d for candlestick patterns) ===
-        price_ohlc_spatial = df_slice[self.price_spatial_cols].values
-        price_ohlc_spatial = torch.tensor(price_ohlc_spatial, dtype=torch.float32, device=self.device)
+        # Group 1: Price Patterns (for CNN temporal processing)
+        price_patterns = df_slice[self.price_patterns_cols].values
+        price_patterns = torch.tensor(price_patterns, dtype=torch.float32, device=self.device)
 
-        # === Group 2: Temporal OHLC (Conv1d for trend evolution) ===
-        price_ohlc_temporal = df_slice[self.price_temporal_cols].values
-        price_ohlc_temporal = torch.tensor(price_ohlc_temporal, dtype=torch.float32, device=self.device)
+        # Group 2: Market Context (current positioning)
+        market_context = df_slice[self.market_context_cols].values
+        market_context = torch.tensor(market_context, dtype=torch.float32, device=self.device)
 
-        # === Group 3: RSI Divergence (Conv1d for RSI divergence detection) ===
-        # 3 channels: RSI + High + Low (all normalized to [-1, 1])
-        rsi_divergence = df_slice[self.rsi_divergence_cols].values
-        rsi_divergence = torch.tensor(rsi_divergence, dtype=torch.float32, device=self.device)
-
-        # === Group 4: MACD Divergence (Conv1d for MACD divergence detection) ===
-        macd_divergence = df_slice[self.macd_feature_cols].values
-        macd_divergence = torch.tensor(macd_divergence, dtype=torch.float32, device=self.device)
-
-        # === Group 5: Price Context (PRE-COMPUTED only, no VP here) ===
-        price_context = df_slice[self.price_context_cols].values
-        price_context = torch.tensor(price_context, dtype=torch.float32, device=self.device)
-
-        # === Group 6: Trend Indicators (PRE-COMPUTED) ===
+        # Group 3: Trend Indicators
         trend_indicators = df_slice[self.trend_feature_cols].values
         trend_indicators = torch.tensor(trend_indicators, dtype=torch.float32, device=self.device)
 
-        # === Group 7: Momentum Oscillators (PRE-COMPUTED - Stochastic only) ===
-        # momentum_oscillators = df_slice[self.momentum_feature_cols].values
-        # momentum_oscillators = torch.tensor(momentum_oscillators, dtype=torch.float32, device=self.device)
-
-        # === Group 8: Volume Profile (all 26 VP features) ===
-        # current_price = float(self.data['close'].iloc[self.current_step])
-        # volume_profile = get_volume_profile_features(self.vp, current_price, self.lookback_window).to(self.device)
-
-        # === Group 9: Daily VP Distribution (50 bins + 4 markers: VAH/VAL/POC/Close) ===
-        # close_prices = torch.tensor(df_slice['close'].values, dtype=torch.float32, device=self.device)
-        # vp_distribution = get_volume_profile_bins(self.vp, self.lookback_window, close_prices).to(self.device)
-
-        # === Group 10: Trading Sessions (PRE-COMPUTED) ===
+        # Group 4: Trading Sessions
         trading_sessions = df_slice[self.trading_session_cols].values
         trading_sessions = torch.tensor(trading_sessions, dtype=torch.float32, device=self.device)
 
-        # === Group 11: Account State ===
+        # Group 5: Account State
         account_state = get_account_state_features(
             self.broker.step_history,
             self.initial_balance,
             self.lookback_window
         ).to(self.device)
 
-        # === Group 12: Position Info ===
+        # Group 6: Position Info
         position_info = get_position_info_features(
             self.broker.step_history,
             self.lookback_window,
@@ -372,15 +310,9 @@ class SimpleTradingEnv(gym.Env):
 
         # Build observation dictionary
         obs_dict = {
-            'price_context': price_context,
+            'price_patterns': price_patterns,
+            'market_context': market_context,
             'trend_indicators': trend_indicators,
-            'price_ohlc_temporal': price_ohlc_temporal,
-            'price_ohlc_spatial': price_ohlc_spatial,
-            'rsi_divergence': rsi_divergence,
-            # 'macd_divergence': macd_divergence,
-            # 'momentum_oscillators': momentum_oscillators,
-            # 'volume_profile': volume_profile,
-            # 'vp_distribution': vp_distribution,
             'trading_sessions': trading_sessions,
             'account_state': account_state,
             'position_info': position_info,
@@ -440,14 +372,14 @@ class SimpleTradingEnv(gym.Env):
 
     def calculate_reward(self, direction, current_state, previous_state):
         """
-        REWARD FUNCTION v23 - BALANCE-FOCUSED TRADING + REDUNDANT ACTION PENALTY
+        REWARD FUNCTION v24 - ENCOURAGING ACTIVE TRADING
 
-        Key Changes:
-        - PRIMARY GOAL: Reward balance increases (realized gains)
-        - Fast TP hits get bonus rewards (1.5x for <10 bars)
-        - Small exploration bonus (2.0)
-        - Moderate penalties for losses
-        - HARD penalty for redundant actions (trying to open when already in position)
+        Key Changes from v23:
+        - INCREASED exploration bonus: 2.0 → 10.0 (encourage trading)
+        - REDUCED SL penalties: -15-30 → -10-20 (less fear of losses)
+        - ADDED idle penalty: -0.5 per step when flat (discourage excessive HOLDing)
+        - Kept balance-focused rewards and TP bonuses
+        - Kept redundant action penalty (-50)
         """
         if previous_state is None:
             return 0.0
@@ -507,8 +439,8 @@ class SimpleTradingEnv(gym.Env):
                 reward += base_reward * duration_bonus
 
             elif 'SL' in reason:
-                # Moderate penalty for SL (scales with loss)
-                penalty = 15.0 + abs(pnl_percent) * 3.0
+                # Reduced penalty for SL (was 15-30, now 10-20)
+                penalty = 10.0 + abs(pnl_percent) * 2.0  # Reduced multiplier from 3.0
 
                 # Extra penalty for very quick losses
                 if duration < 5:
@@ -526,12 +458,16 @@ class SimpleTradingEnv(gym.Env):
                     # Penalty for closing at loss
                     reward -= 10.0 + abs(pnl_percent) * 2.0
 
-        # === 2. EXPLORATION BONUS (Very Small) ===
+        # === 2. EXPLORATION BONUS (Increased to encourage trading) ===
         current_position = current_state.get('position_size', 0)
         previous_position = previous_state.get('position_size', 0)
 
         if previous_position == 0 and current_position != 0:
-            reward += 2.0  # Reduced from 5.0 - just a nudge
+            reward += 10.0  # Increased from 2.0 - significant reward for taking action
+
+        # === 2b. IDLE PENALTY (Discourage excessive HOLDing) ===
+        if current_position == 0 and previous_position == 0:
+            reward -= 0.5  # Small penalty for staying flat
 
         # === 3. POSITION MANAGEMENT (Encourage holding winners) ===
         if current_position != 0:

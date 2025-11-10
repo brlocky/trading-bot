@@ -1,14 +1,18 @@
 """
-Enhanced feature extraction - Phase 0.2 Optimized
+Enhanced feature extraction - Optimized Architecture
 
-Feature Groups:
-1. Price Context: OHLC + spatial relationships
-2. Trend Indicators: EMA slopes, crossovers, momentum
-3. Momentum Oscillators: RSI, Stochastic, MACD
-4. Volume Profile: Session VP levels
-5. Account State, Position Info, Performance Metrics
+Feature Groups (6 groups, 39 features total):
+1. Price Patterns (8): Candle structure, volume, multi-TF returns [CNN]
+2. Market Context (6): EMA/VWAP distances, volatility [MLP]
+3. Trend Indicators (10): EMA slopes, crossovers, momentum [MLP]
+4. Trading Sessions (3): Asia/London/NY flags [Linear]
+5. Account State (5): Balance, equity, PnL, commission [MLP]
+6. Position Info (7): Position status, leverage, distances [MLP]
 
-Total: 7 groups, 60 features per timestep (reduced from 87)
+Architecture rationale:
+- Group 1 (Price Patterns): Temporal sequences → CNN processes patterns over time
+- Groups 2-6: Current state only → MLPs process last timestep
+- Semantic separation: "price action" vs "market positioning" vs "trading state"
 """
 
 import pandas as pd
@@ -16,15 +20,18 @@ import numpy as np
 import torch
 
 
-def precompute_price_context_features(df: pd.DataFrame, window: int = 288) -> list[str]:
-    """Pre-compute price context features."""
-    feature_cols = []
+def precompute_price_patterns_features(df: pd.DataFrame, window: int = 288) -> list[str]:
+    """
+    Pre-compute pure price pattern features for CNN temporal processing.
 
-    # Time features (raw values, no artificial scaling)
-    date_col = pd.to_datetime(df['date'])
-    df['day_of_week'] = date_col.dt.dayofweek.astype(float) / 6.0  # Normalize to 0-1
-    df['hour'] = date_col.dt.hour.astype(float) / 23.0  # Normalize to 0-1
-    feature_cols.extend(['day_of_week', 'hour'])
+    Returns 8 features (all temporal sequences benefit from Conv1d):
+    - 4 candle structure (0-1): body, upper wick, lower wick, close position
+    - 1 volume (0-1): normalized volume
+    - 3 multi-timeframe returns (bounded): 1h, 4h, 24h momentum
+
+    These features capture price action patterns and momentum at different scales.
+    """
+    feature_cols = []
 
     # Candle structure (natural ratios 0-1)
     df['body_ratio'] = (df['close'] - df['open']).abs() / (df['high'] - df['low']).replace(0, 1e-6)
@@ -40,15 +47,49 @@ def precompute_price_context_features(df: pd.DataFrame, window: int = 288) -> li
     df['volume_norm'] = (df['volume'] - volume_rolling_min) / volume_rolling_range
     feature_cols.append('volume_norm')
 
-    # Distance to EMAs (natural ratios)
+    # Multi-timeframe returns (bounded via tanh)
+    # 1h = 4 candles (15min), 4h = 16 candles, 24h = 96 candles
+    df['returns_1h'] = np.tanh(df['close'].pct_change(periods=4).fillna(0) * 100)  # Scale by 100 for sensitivity
+    df['returns_4h'] = np.tanh(df['close'].pct_change(periods=16).fillna(0) * 100)
+    df['returns_24h'] = np.tanh(df['close'].pct_change(periods=96).fillna(0) * 100)
+    feature_cols.extend(['returns_1h', 'returns_4h', 'returns_24h'])
+
+    return feature_cols
+
+
+def precompute_market_context_features(df: pd.DataFrame, window: int = 288) -> list[str]:
+    """
+    Pre-compute market context features (spatial relationships, last timestep only).
+
+    Returns 6 features:
+    - 5 distance to EMAs/VWAP (bounded via tanh): current price positioning
+    - 1 volatility (0-1): current market volatility state
+
+    These features represent WHERE price is relative to key levels, not HOW it got there.
+    Only current values matter, no need for temporal processing.
+    """
+    feature_cols = []
+
+    # Distance to EMAs (bounded via tanh to [-1, 1])
+    # Scale by 10 so ±10% distance maps to ~±1.0
     for period in [9, 21, 50, 100]:
         dist_col = f'dist_ema{period}'
-        df[dist_col] = (df['close'] - df[f'ema{period}']) / df['close']
+        raw_distance = (df['close'] - df[f'ema{period}']) / df['close']
+        df[dist_col] = np.tanh(raw_distance * 10.0)
         feature_cols.append(dist_col)
 
-    # Distance to VWAP (natural ratio)
-    df['dist_vwap'] = (df['close'] - df['vwap']) / df['close']
+    # Distance to VWAP (bounded via tanh)
+    df['dist_vwap'] = np.tanh((df['close'] - df['vwap']) / df['close'] * 10.0)
     feature_cols.append('dist_vwap')
+
+    # Volatility (normalized to 0-1 range)
+    # Use rolling std of returns as volatility proxy
+    rolling_std = df['close'].pct_change().rolling(window=20, min_periods=1).std()
+    rolling_std_min = rolling_std.rolling(window=window, min_periods=1).min()
+    rolling_std_max = rolling_std.rolling(window=window, min_periods=1).max()
+    rolling_std_range = (rolling_std_max - rolling_std_min).replace(0, 1e-6)
+    df['volatility'] = ((rolling_std - rolling_std_min) / rolling_std_range).fillna(0)
+    feature_cols.append('volatility')
 
     return feature_cols
 
