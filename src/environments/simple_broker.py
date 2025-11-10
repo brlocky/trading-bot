@@ -50,7 +50,6 @@ class SimpleBroker:
         self.position_size = 0.0
         self.position_value = 0.0
         self.avg_entry_price = 0.0
-        self.entry_bar = 0  # Track when position was opened
         self.traded = False
 
         # --- Risk Management ---
@@ -173,7 +172,6 @@ class SimpleBroker:
         self.position_size = share_size
         self.position_value = abs(share_size) * entry_price
         self.avg_entry_price = entry_price
-        self.entry_bar = self.current_step
 
         # Update account
         self.current_balance -= commission

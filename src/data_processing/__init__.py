@@ -5,7 +5,9 @@ from .enhanced_features import (
     precompute_price_context_features,
     precompute_trend_features,
     precompute_momentum_features,
-    precompute_trading_sessions
+    precompute_trading_sessions,
+    precompute_spatial_price_normalized_features,
+    precompute_temporal_price_normalized_features,
 )
 
 __all__ = [
@@ -15,5 +17,7 @@ __all__ = [
     'precompute_price_context_features',
     'precompute_trend_features',
     'precompute_momentum_features',
-    'precompute_trading_sessions'
+    'precompute_trading_sessions',
+    'precompute_spatial_price_normalized_features',
+    'precompute_temporal_price_normalized_features',
 ]

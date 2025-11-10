@@ -37,9 +37,12 @@ from data_processing.enhanced_features import (
     get_volume_profile_features,
     get_volume_profile_bins,
     precompute_price_context_features,
+    precompute_spatial_price_normalized_features,
+    precompute_temporal_price_normalized_features,
     precompute_trend_features,
     precompute_momentum_features,
     precompute_rsi_features,
+    precompute_rsi_divergence_features,
     precompute_macd_features,
     precompute_trading_sessions
 )
@@ -72,11 +75,14 @@ class SimpleTradingEnv(gym.Env):
         self.data = self.data.dropna().reset_index(drop=True)
 
         # Prepare data with all features - pre-compute all static features (modifies in place)
-        self.price_context_cols = precompute_price_context_features(self.data)
+        self.price_spatial_cols = precompute_spatial_price_normalized_features(self.data)
+        self.price_temporal_cols = precompute_temporal_price_normalized_features(self.data, window=lookback_window)
+        self.price_context_cols = precompute_price_context_features(self.data, window=lookback_window)
         self.trend_feature_cols = precompute_trend_features(self.data)
-        self.momentum_feature_cols = precompute_momentum_features()
-        self.rsi_feature_cols = precompute_rsi_features()
-        self.macd_feature_cols = precompute_macd_features(self.data)
+        self.momentum_feature_cols = precompute_momentum_features(self.data)
+        self.rsi_feature_cols = precompute_rsi_features(self.data)
+        self.rsi_divergence_cols = precompute_rsi_divergence_features(self.data, window=lookback_window)
+        self.macd_feature_cols = precompute_macd_features(self.data, window=lookback_window)
         self.trading_session_cols = precompute_trading_sessions(self.data)
 
         # Action space: [direction, risk_reward_ratio, atr_multiplier]
@@ -98,12 +104,7 @@ class SimpleTradingEnv(gym.Env):
             ),
             'rsi_divergence': gym.spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(lookback_window, len(self.rsi_feature_cols)),
-                dtype=np.float32
-            ),
-            'macd_divergence': gym.spaces.Box(
-                low=-np.inf, high=np.inf,
-                shape=(lookback_window, len(self.macd_feature_cols)),
+                shape=(lookback_window, len(self.rsi_divergence_cols)),
                 dtype=np.float32
             ),
             'price_context': gym.spaces.Box(
@@ -116,21 +117,6 @@ class SimpleTradingEnv(gym.Env):
                 shape=(lookback_window, len(self.trend_feature_cols)),
                 dtype=np.float32
             ),
-            'momentum_oscillators': gym.spaces.Box(
-                low=-np.inf, high=np.inf,
-                shape=(lookback_window, len(self.momentum_feature_cols)),
-                dtype=np.float32
-            ),
-            'volume_profile': gym.spaces.Box(
-                low=-np.inf, high=np.inf,
-                shape=(lookback_window, 26),
-                dtype=np.float32
-            ),
-            'vp_distribution': gym.spaces.Box(
-                low=0, high=1,
-                shape=(lookback_window, n_bins + 4),
-                dtype=np.float32
-            ),
             'trading_sessions': gym.spaces.Box(
                 low=0, high=1,
                 shape=(lookback_window, len(self.trading_session_cols)),
@@ -138,12 +124,12 @@ class SimpleTradingEnv(gym.Env):
             ),
             'account_state': gym.spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(lookback_window, 1),
+                shape=(lookback_window, 5),
                 dtype=np.float32
             ),
             'position_info': gym.spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(lookback_window, 2),
+                shape=(lookback_window, 7),
                 dtype=np.float32
             ),
         })
@@ -196,7 +182,7 @@ class SimpleTradingEnv(gym.Env):
         # Unpack action: [direction, risk_reward_idx, atr_idx]
         direction_action, rr_idx, atr_idx = int(action[0]), int(action[1]), int(action[2])
         risk_reward_ratio = 1.0 + (rr_idx * 1.0)  # Maps 0-9 to 1.0-10.0
-        atr_multiplier = 1.0 + (atr_idx * 0.2)    # Maps 0-9 to 1.0-2.8
+        atr_multiplier = 2.0 + (atr_idx * 0.3)    # Maps 0-9 to 2.0-4.7 (wider SL)
 
         # Convert to actual prices
         current_price = self.data['close'].iloc[self.current_step].item()
@@ -229,7 +215,7 @@ class SimpleTradingEnv(gym.Env):
 
         current_state = self.broker.get_state()
 
-        reward = self.calculate_reward(current_state, previous_state)
+        reward = self.calculate_reward(direction_action, current_state, previous_state)
 
         done = False
         truncated = False
@@ -284,15 +270,16 @@ class SimpleTradingEnv(gym.Env):
         df_slice = self.data.iloc[start_idx:end_idx].copy()
 
         # === Group 1: Spatial OHLC (Conv2d for candlestick patterns) ===
-        price_ohlc_spatial = df_slice[['open', 'high', 'low', 'close']].values
+        price_ohlc_spatial = df_slice[self.price_spatial_cols].values
         price_ohlc_spatial = torch.tensor(price_ohlc_spatial, dtype=torch.float32, device=self.device)
 
         # === Group 2: Temporal OHLC (Conv1d for trend evolution) ===
-        price_ohlc_temporal = df_slice[['open', 'high', 'low', 'close']].values
+        price_ohlc_temporal = df_slice[self.price_temporal_cols].values
         price_ohlc_temporal = torch.tensor(price_ohlc_temporal, dtype=torch.float32, device=self.device)
 
         # === Group 3: RSI Divergence (Conv1d for RSI divergence detection) ===
-        rsi_divergence = df_slice[self.rsi_feature_cols].values
+        # 3 channels: RSI + High + Low (all normalized to [-1, 1])
+        rsi_divergence = df_slice[self.rsi_divergence_cols].values
         rsi_divergence = torch.tensor(rsi_divergence, dtype=torch.float32, device=self.device)
 
         # === Group 4: MACD Divergence (Conv1d for MACD divergence detection) ===
@@ -308,16 +295,16 @@ class SimpleTradingEnv(gym.Env):
         trend_indicators = torch.tensor(trend_indicators, dtype=torch.float32, device=self.device)
 
         # === Group 7: Momentum Oscillators (PRE-COMPUTED - Stochastic only) ===
-        momentum_oscillators = df_slice[self.momentum_feature_cols].values
-        momentum_oscillators = torch.tensor(momentum_oscillators, dtype=torch.float32, device=self.device)
+        # momentum_oscillators = df_slice[self.momentum_feature_cols].values
+        # momentum_oscillators = torch.tensor(momentum_oscillators, dtype=torch.float32, device=self.device)
 
         # === Group 8: Volume Profile (all 26 VP features) ===
-        current_price = float(self.data['close'].iloc[self.current_step])
-        volume_profile = get_volume_profile_features(self.vp, current_price, self.lookback_window).to(self.device)
+        # current_price = float(self.data['close'].iloc[self.current_step])
+        # volume_profile = get_volume_profile_features(self.vp, current_price, self.lookback_window).to(self.device)
 
         # === Group 9: Daily VP Distribution (50 bins + 4 markers: VAH/VAL/POC/Close) ===
-        close_prices = torch.tensor(df_slice['close'].values, dtype=torch.float32, device=self.device)
-        vp_distribution = get_volume_profile_bins(self.vp, self.lookback_window, close_prices).to(self.device)
+        # close_prices = torch.tensor(df_slice['close'].values, dtype=torch.float32, device=self.device)
+        # vp_distribution = get_volume_profile_bins(self.vp, self.lookback_window, close_prices).to(self.device)
 
         # === Group 10: Trading Sessions (PRE-COMPUTED) ===
         trading_sessions = df_slice[self.trading_session_cols].values
@@ -338,15 +325,15 @@ class SimpleTradingEnv(gym.Env):
 
         # Build observation dictionary
         obs_dict = {
-            'price_ohlc_spatial': price_ohlc_spatial,
-            'price_ohlc_temporal': price_ohlc_temporal,
-            'rsi_divergence': rsi_divergence,
-            'macd_divergence': macd_divergence,
             'price_context': price_context,
             'trend_indicators': trend_indicators,
-            'momentum_oscillators': momentum_oscillators,
-            'volume_profile': volume_profile,
-            'vp_distribution': vp_distribution,
+            'price_ohlc_temporal': price_ohlc_temporal,
+            'price_ohlc_spatial': price_ohlc_spatial,
+            'rsi_divergence': rsi_divergence,
+            # 'macd_divergence': macd_divergence,
+            # 'momentum_oscillators': momentum_oscillators,
+            # 'volume_profile': volume_profile,
+            # 'vp_distribution': vp_distribution,
             'trading_sessions': trading_sessions,
             'account_state': account_state,
             'position_info': position_info,
@@ -358,66 +345,149 @@ class SimpleTradingEnv(gym.Env):
                 print(f"Warning: NaN/Inf in {key} at step {self.current_step}")
                 tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1e6, neginf=-1e6)
                 raise ValueError(f"NaN/Inf detected in observation tensor '{key}'.")
+
+            # Check for values outside [-1, 1] range
+            tensor_min = tensor.min().item()
+            tensor_max = tensor.max().item()
+            if tensor_min < -1.0 or tensor_max > 1.0:
+                # Find indices of invalid values
+                min_idx = (tensor == tensor_min).nonzero(as_tuple=False)[0].tolist()
+                max_idx = (tensor == tensor_max).nonzero(as_tuple=False)[0].tolist()
+                print(f"Warning: Values outside [-1, 1] in '{key}' at step {self.current_step}:")
+                print(f"  min={tensor_min:.4f} at indices {min_idx[:5]}{'...' if len(min_idx) > 5 else ''}")
+                print(f"  max={tensor_max:.4f} at indices {max_idx[:5]}{'...' if len(max_idx) > 5 else ''}")
+
             # Convert to CPU NumPy array for Stable-Baselines3
             obs_dict[key] = tensor.cpu().numpy().astype(np.float32)
 
         return obs_dict
 
-    def calculate_reward(self, current_state, previous_state):
+    def calculate_reward(self, direction, current_state, previous_state):
         """
-        REWARD FUNCTION v16 - FORCE TRADING: Penalize doing nothing
+        REWARD FUNCTION v23 - BALANCE-FOCUSED TRADING + REDUNDANT ACTION PENALTY
+
+        Key Changes:
+        - PRIMARY GOAL: Reward balance increases (realized gains)
+        - Fast TP hits get bonus rewards (1.5x for <10 bars)
+        - Small exploration bonus (2.0)
+        - Moderate penalties for losses
+        - HARD penalty for redundant actions (trying to open when already in position)
         """
         if previous_state is None:
             return 0.0
 
         reward = 0.0
+
+        # === 0. REDUNDANT ACTION PENALTY (CRITICAL FOR DISCRETE BOT) ===
+        # Penalize trying to open LONG when already LONG, or SHORT when already SHORT
+        previous_position = previous_state.get('position_size', 0)
+        current_position = current_state.get('position_size', 0)
+
+        # Check if position didn't change (means action was ignored by broker)
+        if previous_position != 0 and current_position == previous_position:
+            # Get the last action from history
+            if direction != 0:  # IF not HOLD
+                # HARD PENALTY: Agent should learn to use HOLD or CLOSE instead
+                reward -= 50.0
+
+        # === 1. BALANCE CHANGE (PRIMARY GOAL) ===
+        # Track balance (not equity) to reward only REALIZED gains
+        current_balance = current_state.get('current_balance')
+        previous_balance = previous_state.get('current_balance')
+        balance_change = current_balance - previous_balance
+
+        # Strong multiplier - balance growth is the main objective
+        if balance_change != 0:
+            reward += balance_change * 0.5  # 50% of dollar change as reward
+
+        # === 1. TRADE COMPLETION REWARDS (SECONDARY SIGNAL) ===
         current_trades = current_state.get('trades', [])
         previous_trades = previous_state.get('trades', [])
-
-        # === TRADE COMPLETION REWARDS ===
         current_closed = [t for t in current_trades if t.get('status') == 'CLOSED']
         previous_closed = [t for t in previous_trades if t.get('status') == 'CLOSED']
 
         if len(current_closed) > len(previous_closed):
-            trade = current_closed[-1]
-            pnl_pct = trade.get('pnl_percent', 0)
-            reason = trade.get('reason', '')
+            new_trade = current_closed[-1]
+            pnl_percent = new_trade.get('pnl_percent', 0)
+            duration = new_trade.get('duration', 0)
+            reason = new_trade.get('reason', 'Unknown')
+
+            # Note: Balance change already rewarded above, this adds trade-specific bonuses
 
             if 'TP' in reason:
-                reward = 100.0 * (1.0 + pnl_pct / 100.0)
-            elif 'SL' in reason:
-                reward = -20.0 * (1.0 + abs(pnl_pct) / 100.0)
-            else:
-                reward = -5.0
+                # Big reward for TP hits (scales with profit)
+                base_reward = 50.0 + abs(pnl_percent) * 10.0
 
-        # === HOLDING INCENTIVE ===
+                # Duration bonus: FAST TP = EXCELLENT! Slow TP = less capital efficient
+                if duration <= 10:
+                    duration_bonus = 1.5  # BONUS for quick wins (1-10 bars)
+                elif duration <= 50:
+                    duration_bonus = 1.2  # Good for medium-term (11-50 bars)
+                elif duration <= 100:
+                    duration_bonus = 1.0  # Neutral (51-100 bars)
+                else:
+                    duration_bonus = 0.8  # Slight penalty for very slow TPs (>100 bars)
+
+                reward += base_reward * duration_bonus
+
+            elif 'SL' in reason:
+                # Moderate penalty for SL (scales with loss)
+                penalty = 15.0 + abs(pnl_percent) * 3.0
+
+                # Extra penalty for very quick losses
+                if duration < 5:
+                    penalty *= 1.5  # Hit SL too fast = bad trade
+
+                reward -= penalty
+
+            else:  # Manual close
+                # Penalize manual closes unless profitable
+                if pnl_percent > 1.0:  # Only reward if >1% profit
+                    reward += 10.0 + pnl_percent * 5.0
+                elif pnl_percent > 0:
+                    reward += 2.0  # Small reward for small profit
+                else:
+                    # Penalty for closing at loss
+                    reward -= 10.0 + abs(pnl_percent) * 2.0
+
+        # === 2. EXPLORATION BONUS (Very Small) ===
         current_position = current_state.get('position_size', 0)
+        previous_position = previous_state.get('position_size', 0)
+
+        if previous_position == 0 and current_position != 0:
+            reward += 2.0  # Reduced from 5.0 - just a nudge
+
+        # === 3. POSITION MANAGEMENT (Encourage holding winners) ===
         if current_position != 0:
             unrealized_pnl = current_state.get('unrealized_pnl', 0)
-            if unrealized_pnl > 0:
-                reward += 0.1
-            else:
-                reward -= 0.05
+            used_balance = current_state.get('used_balance', 1)
+            unrealized_pct = (unrealized_pnl / used_balance * 100) if used_balance > 0 else 0
 
-        # === NEW: PENALIZE INACTION (Force agent to trade) ===
-        else:  # No position held
-            # Count steps since last trade
-            self.steps_since_close = getattr(self, 'steps_since_close', 0) + 1
+            # Reward holding winning positions
+            if unrealized_pct > 1.0:
+                reward += min(unrealized_pct * 0.3, 3.0)  # Small capped reward
 
-            # After 100 steps of doing nothing, start penalizing
-            if self.steps_since_close > 100:
-                inaction_penalty = -0.01 * (self.steps_since_close - 100)  # Grows over time
-                reward += max(inaction_penalty, -5.0)  # Cap at -5
+            # Penalize deep drawdowns
+            elif unrealized_pct < -3.0:
+                reward += unrealized_pct * 0.3  # Negative value
 
-        # Reset counter when trade closes
-        if len(current_closed) > len(previous_closed):
-            self.steps_since_close = 0
+            # Between -3% and +1%: NEUTRAL
 
-        # === BANKRUPTCY PENALTY ===
+        else:
+            # Track inaction when flat
+            self.steps_since_close += 1
+
+            # Penalize excessive inaction (>500 steps = ~42 hours)
+            if self.steps_since_close > 500:
+                inaction_penalty = min((self.steps_since_close - 500) * 0.02, 15.0)
+                reward -= inaction_penalty
+
+        # === 4. BANKRUPTCY PENALTY ===
         if self.broker.is_bankrupt:
-            reward = -200.0
+            reward = -500.0
 
-        return float(np.clip(reward, -200.0, 200.0))
+        # Clip to prevent extreme values
+        return float(np.clip(reward, -500.0, 500.0))
 
     def render(self):
         visualizer = GenericTradingVisualizer(subplot_config=create_advanced_config())

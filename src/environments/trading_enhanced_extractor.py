@@ -680,15 +680,16 @@ class TemporalOHLCCNN(nn.Module):
 
 class RSI_DivergenceCNN(nn.Module):
     """
-    RSI Divergence CNN with Price Context (High/Low).
+    RSI Divergence CNN with Price Context.
 
-    Input: 3 channels (RSI + High + Low) to detect proper divergences
+    Input: 3 channels (RSI + High + Low) all normalized to [-1, 1]
+    Learns divergence patterns: "RSI rising while price falling" etc.
     """
 
     def __init__(self, hidden_dim=32):
         super().__init__()
 
-        # Accept 3 channels: RSI + High + Low
+        # Accept 3 channels: RSI + High + Low (all normalized [-1, 1])
         self.divergence_paths = nn.ModuleList([
             nn.Sequential(
                 nn.Conv1d(3, 8, kernel_size=5, padding=2),
@@ -802,17 +803,27 @@ class MACD_DivergenceCNN(nn.Module):
 
 class TradingEnhancedExtractor(BaseFeaturesExtractor):
     """
-    ENHANCED Multi-Input Feature Extractor with Pattern Recognition.
+    SIMPLIFIED Multi-Input Feature Extractor for Trading.
 
     ARCHITECTURE:
-    - Original 11 groups (OHLC, price context, trends, etc.)
-    - NEW: 4 pattern detection groups:
-        1. Range Detection (32-dim)
-        2. Elliott Wave Patterns (48-dim)
-        3. Reversal Patterns (32-dim)
-        4. Support/Resistance (32-dim)
+    - Active feature groups (8):
+        1. OHLC Spatial CNN (32-dim) - Candlestick patterns
+        2. OHLC Temporal CNN (64-dim) - Trend evolution
+        3. RSI Divergence CNN (32-dim) - RSI pattern detection
+        4. Price Context Transformer (32-dim) - Price structure
+        5. Trend Indicators Transformer (32-dim) - Trend features
+        6. Trading Sessions MLP (4-dim) - Session markers
+        7. Account State MLP (4-dim) - Balance/equity/pnl/commission (5 features)
+        8. Position Info MLP (4-dim) - Position status/leverage/distances/duration (7 features)
 
-    Total output: 364-dim → 256-dim fused features
+    - Disabled (not in environment):
+        - MACD Divergence CNN
+        - Momentum Oscillators MLP
+        - Volume Profile features
+        - VP Distribution bins
+        - Pattern detection CNNs (Range, Elliott Wave, Reversal, S/R)
+
+    Total output: 204-dim → 256-dim fused features
     """
 
     def __init__(self, observation_space: spaces.Dict, hidden_dim=128, **kwargs):
@@ -833,22 +844,18 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
         # 3. RSI Divergence CNN
         self.rsi_divergence_cnn = RSI_DivergenceCNN(hidden_dim=32)
 
-        # 4. MACD Divergence CNN
-        self.macd_divergence_cnn = MACD_DivergenceCNN(hidden_dim=32)
+        # === NEW PATTERN ENCODERS (DISABLED - not in environment) ===
+        # # 4. Range Detection CNN
+        # self.range_cnn = RangeDetectionCNN(hidden_dim=32)
 
-        # === NEW PATTERN ENCODERS ===
+        # # 5. Elliott Wave CNN
+        # self.elliott_wave_cnn = ElliottWaveCNN(hidden_dim=48)
 
-        # 5. Range Detection CNN
-        self.range_cnn = RangeDetectionCNN(hidden_dim=32)
+        # # 6. Reversal Pattern CNN
+        # self.reversal_pattern_cnn = ReversalPatternCNN(hidden_dim=32)
 
-        # 6. Elliott Wave CNN
-        self.elliott_wave_cnn = ElliottWaveCNN(hidden_dim=48)
-
-        # 7. Reversal Pattern CNN
-        self.reversal_pattern_cnn = ReversalPatternCNN(hidden_dim=32)
-
-        # 8. Support/Resistance CNN
-        self.support_resistance_cnn = SupportResistanceCNN(hidden_dim=32)
+        # # 7. Support/Resistance CNN
+        # self.support_resistance_cnn = SupportResistanceCNN(hidden_dim=32)
 
         # === ORIGINAL TRANSFORMERS & MLPs ===
 
@@ -864,36 +871,17 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
         self.price_output = nn.Linear(64, 32)
 
         # Trend Indicators: Transformer
-        self.trend_projection = nn.Linear(self.shapes['trend_indicators'][-1], 64)
-        trend_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=64, nhead=4, dim_feedforward=128,
-            dropout=0.1, activation='gelu', batch_first=True, norm_first=True
-        )
-        self.trend_transformer = nn.TransformerEncoder(
-            trend_encoder_layer, num_layers=2, enable_nested_tensor=False
-        )
-        self.trend_output = nn.Linear(64, 32)
-
-        # Momentum Oscillators: MLP
-        self.momentum_encoder = nn.Sequential(
-            nn.Linear(self.shapes['momentum_oscillators'][-1], 48),
-            nn.LayerNorm(48),
+        # Trend Indicators: Simple MLP (reduced from Transformer to prevent over-activation)
+        # Binary features (crossovers) + slopes don't need complex temporal modeling
+        self.trend_encoder = nn.Sequential(
+            nn.Linear(self.shapes['trend_indicators'][-1], 64),
+            nn.LayerNorm(64),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(48, 24),
+            nn.Linear(64, 32),
+            nn.LayerNorm(32),  # Extra normalization to keep activations in check
             nn.GELU(),
         )
-
-        # Volume Profile: Transformer
-        self.vp_projection = nn.Linear(self.shapes['volume_profile'][-1], 48)
-        vp_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=48, nhead=4, dim_feedforward=96,
-            dropout=0.1, activation='gelu', batch_first=True, norm_first=True
-        )
-        self.vp_transformer = nn.TransformerEncoder(
-            vp_encoder_layer, num_layers=2, enable_nested_tensor=False
-        )
-        self.vp_output = nn.Linear(48, 24)
 
         # Trading Sessions: MLP
         self.session_encoder = nn.Sequential(
@@ -904,7 +892,7 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
             nn.GELU(),
         )
 
-        # Account State: MLP
+        # Account State: MLP (5 features: equity, balance, unrealized_pnl, realized_pnl, commission)
         self.account_encoder = nn.Sequential(
             nn.Linear(self.shapes['account_state'][-1], 8),
             nn.LayerNorm(8),
@@ -913,7 +901,7 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
             nn.GELU(),
         )
 
-        # Position Info: MLP
+        # Position Info: MLP (7 features: status, leverage, unrealized_pnl_pct, distance_to_sl, distance_to_tp, risk_reward, duration)
         self.position_encoder = nn.Sequential(
             nn.Linear(self.shapes['position_info'][-1], 8),
             nn.LayerNorm(8),
@@ -922,35 +910,18 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
             nn.GELU(),
         )
 
-        # Volume Profile Bins: CNN
-        self.vp_bins_cnn = nn.Sequential(
-            nn.Conv1d(54, 64, kernel_size=5, padding=2),
-            nn.GroupNorm(8, 64),
-            nn.ReLU(),
-            nn.Conv1d(64, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.ReLU(),
-            nn.Conv1d(64, 32, kernel_size=3, padding=1),
-            nn.GroupNorm(4, 32),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1)
-        )
-        self.vp_bins_output = nn.Linear(32, 16)
-
         # === TEMPORAL POOLING ===
-        self.temporal_attention_24 = nn.MultiheadAttention(
-            embed_dim=24, num_heads=4, dropout=0.1, batch_first=True
-        )
         self.temporal_attention_32 = nn.MultiheadAttention(
             embed_dim=32, num_heads=4, dropout=0.1, batch_first=True
         )
 
-        self.pool_query_24 = nn.Parameter(torch.randn(1, 1, 24) * 0.01)
         self.pool_query_32 = nn.Parameter(torch.randn(1, 1, 32) * 0.01)
 
         # === FUSION LAYER ===
-        # Total: 32+64+32+32+32+48+32+32 (patterns) + 32+32+24+24+4+4+4+16 (original) = 444
-        combined_dim = 32 + 64 + 32 + 32 + 32 + 48 + 32 + 32 + 32 + 32 + 24 + 24 + 4 + 4 + 4 + 16
+        # Active: ohlc_spatial(32) + ohlc_temporal(64) + rsi_divergence(32) +
+        #         price(32) + trend(32) + session(4) + account(4) + position(4)
+        # Total: 204
+        combined_dim = 32 + 64 + 32 + 32 + 32 + 4 + 4 + 4
 
         self.fusion = nn.Sequential(
             nn.Linear(combined_dim, hidden_dim * 2),
@@ -979,47 +950,16 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
         # === PROCESS OHLC-BASED GROUPS ===
         ohlc_seq = obs_tensors['price_ohlc_spatial']  # [B, T, 4] - OHLC
 
-        # Extract High and Low for divergence detection
-        high_seq = ohlc_seq[:, :, 1:2]  # [B, T, 1] - High
-        low_seq = ohlc_seq[:, :, 2:3]   # [B, T, 1] - Low
-
-        # Normalize High/Low to [0, 1] range over lookback window for divergence detection
-        # This puts price in same scale as RSI (0-100) and MACD (normalized)
-        high_min = high_seq.min(dim=1, keepdim=True)[0]
-        high_max = high_seq.max(dim=1, keepdim=True)[0]
-        high_normalized = (high_seq - high_min) / (high_max - high_min + 1e-8)  # [B, T, 1]
-
-        low_min = low_seq.min(dim=1, keepdim=True)[0]
-        low_max = low_seq.max(dim=1, keepdim=True)[0]
-        low_normalized = (low_seq - low_min) / (low_max - low_min + 1e-8)  # [B, T, 1]
-
-        # Scale to [0, 100] to match RSI range
-        high_normalized = high_normalized * 100.0
-        low_normalized = low_normalized * 100.0
-
         # Original encoders
         ohlc_spatial = self.ohlc_spatial_cnn(ohlc_seq)         # [B, 32]
         ohlc_temporal = self.ohlc_temporal_cnn(ohlc_seq)       # [B, 64]
 
-        # NEW pattern encoders (all use same OHLC input)
-        range_features = self.range_cnn(ohlc_seq)              # [B, 32]
-        elliott_features = self.elliott_wave_cnn(ohlc_seq)     # [B, 48]
-        reversal_features = self.reversal_pattern_cnn(ohlc_seq)  # [B, 32]
-        support_resistance = self.support_resistance_cnn(ohlc_seq)  # [B, 32]
+        # === PROCESS DIVERGENCE GROUPS ===
 
-        # === PROCESS DIVERGENCE GROUPS WITH NORMALIZED PRICE ===
-
-        # RSI Divergence: Concatenate RSI + Normalized High + Normalized Low
-        # Now all in [0-100] range - CNN can learn: "RSI rising while price falling"
-        rsi_seq = obs_tensors['rsi_divergence']  # [B, T, 1] - RSI (0-100)
-        rsi_with_price = torch.cat([rsi_seq, high_normalized, low_normalized], dim=2)  # [B, T, 3]
-        rsi_divergence = self.rsi_divergence_cnn(rsi_with_price)      # [B, 32]
-
-        # MACD Divergence: Concatenate MACD features + Normalized High + Normalized Low
-        # MACD is already normalized, price scaled to [0-100]
-        macd_seq = obs_tensors['macd_divergence']  # [B, T, 3] - MACD, Signal, Hist (normalized)
-        macd_with_price = torch.cat([macd_seq, high_normalized, low_normalized], dim=2)  # [B, T, 5]
-        macd_divergence = self.macd_divergence_cnn(macd_with_price)   # [B, 32]
+        # RSI Divergence: RSI + High + Low (all normalized to [-1, 1] in enhanced_features.py)
+        # CNN learns: "RSI rising while High falling" → Bearish divergence
+        rsi_seq = obs_tensors['rsi_divergence']  # [B, T, 3] - RSI + High + Low
+        rsi_divergence = self.rsi_divergence_cnn(rsi_seq)      # [B, 32]
 
         # Price Context
         price_seq = obs_tensors['price_context']
@@ -1028,24 +968,9 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
         price_encoded = self.price_output(price_transformed)
         price_pooled = self._pool_temporal(price_encoded, method='attention')  # [B, 32]
 
-        # Trend Indicators
+        # Trend Indicators: Simple MLP on last timestep (no temporal modeling needed)
         trend_seq = obs_tensors['trend_indicators']
-        trend_proj = self.trend_projection(trend_seq)
-        trend_transformed = self.trend_transformer(trend_proj)
-        trend_encoded = self.trend_output(trend_transformed)
-        trend_pooled = self._pool_temporal(trend_encoded, method='attention')  # [B, 32]
-
-        # Momentum Oscillators
-        momentum_seq = obs_tensors['momentum_oscillators']
-        momentum_encoded = self.momentum_encoder(momentum_seq)
-        momentum_pooled = self._pool_temporal(momentum_encoded, method='last')  # [B, 24]
-
-        # Volume Profile
-        vp_seq = obs_tensors['volume_profile']
-        vp_proj = self.vp_projection(vp_seq)
-        vp_transformed = self.vp_transformer(vp_proj)
-        vp_encoded = self.vp_output(vp_transformed)
-        vp_pooled = self._pool_temporal(vp_encoded, method='attention')  # [B, 24]
+        trend_pooled = self.trend_encoder(trend_seq[:, -1, :])  # [B, 32]
 
         # Trading Sessions
         session_seq = obs_tensors['trading_sessions']
@@ -1062,32 +987,17 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
         position_encoded = self.position_encoder(position_seq)
         position_pooled = position_encoded[:, -1, :]  # [B, 4]
 
-        # Volume Profile Bins
-        vp_bins_seq = obs_tensors['vp_distribution']
-        vp_bins_transposed = vp_bins_seq.transpose(1, 2)
-        vp_bins_cnn_out = self.vp_bins_cnn(vp_bins_transposed)
-        vp_bins_encoded = vp_bins_cnn_out.squeeze(-1)
-        vp_bins_pooled = self.vp_bins_output(vp_bins_encoded)  # [B, 16]
-
         # === CONCATENATE ALL EMBEDDINGS ===
         combined = torch.cat([
             ohlc_spatial,           # 32
             ohlc_temporal,          # 64
             rsi_divergence,         # 32
-            macd_divergence,        # 32
-            range_features,         # 32 - NEW
-            elliott_features,       # 48 - NEW
-            reversal_features,      # 32 - NEW
-            support_resistance,     # 32 - NEW
             price_pooled,           # 32
             trend_pooled,           # 32
-            momentum_pooled,        # 24
-            vp_pooled,              # 24
             session_pooled,         # 4
             account_pooled,         # 4
             position_pooled,        # 4
-            vp_bins_pooled,         # 16
-        ], dim=1)  # [B, 444]
+        ], dim=1)  # [B, 204]
 
         # === FUSION ===
         fused = self.fusion(combined)  # [B, hidden_dim*2]
@@ -1106,13 +1016,11 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
             batch_size = x.shape[0]
             feat_dim = x.shape[2]
 
-            if feat_dim == 24:
-                attention_module = self.temporal_attention_24
-                query = self.pool_query_24.expand(batch_size, -1, -1)
-            elif feat_dim == 32:
+            if feat_dim == 32:
                 attention_module = self.temporal_attention_32
                 query = self.pool_query_32.expand(batch_size, -1, -1)
             else:
+                # Fallback to last for unsupported dimensions
                 return x[:, -1, :]
 
             pooled, _ = attention_module(query, x, x)
