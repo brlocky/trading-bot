@@ -116,3 +116,119 @@ class TestRiskManagement:
         self.broker.step(len(prices)+1, 0, 112.0, 113.0, 111.0, tp_price_hold, sl_price_hold)
         assert self.broker.position_size == 0.0
         assert self.broker.realized_pnl > 0
+
+    def test_calculate_share_size_risk_based(self):
+        """Test _calculate_share_size respects 1% risk rule"""
+        # Test normal risk-based sizing
+        cash = 10000.0
+        entry_price = 50000.0
+        stop_loss = 49000.0  # 2% away from entry
+
+        share_size = self.broker._calculate_share_size(cash, entry_price, stop_loss, risk_percentage=0.01)
+
+        # Risk per share = |50000 - 49000| = 1000
+        # Risk amount = 10000 * 0.01 = 100
+        # Expected shares = 100 / 1000 = 0.1
+        expected_shares = 0.1
+
+        assert abs(share_size - expected_shares) < 0.001, f"Expected {expected_shares}, got {share_size}"
+
+        # Verify position value is within reasonable bounds
+        position_value = share_size * entry_price
+        assert position_value <= cash * 10.0, "Position value exceeds 10x leverage"
+
+    def test_calculate_share_size_leverage_limit(self):
+        """Test _calculate_share_size enforces 10x leverage limit"""
+        # Test with very tight stop loss (would exceed 10x without limit)
+        cash = 1000.0
+        entry_price = 50000.0
+        stop_loss = 49950.0  # Only 0.1% away - very tight!
+
+        share_size = self.broker._calculate_share_size(cash, entry_price, stop_loss, risk_percentage=0.01)
+
+        # Risk per share = |50000 - 49950| = 50
+        # Risk amount = 1000 * 0.01 = 10
+        # Risk-based shares = 10 / 50 = 0.2 (position value = 10,000)
+        # But max leverage = 1000 * 10 = 10,000
+        # Max shares by leverage = 10000 / 50000 = 0.2
+        # Should take minimum = 0.2
+
+        position_value = share_size * entry_price
+        max_position_value = cash * 10.0
+
+        assert position_value <= max_position_value, f"Position {position_value} exceeds 10x leverage {max_position_value}"
+        assert share_size > 0, "Share size should not be zero"
+
+    def test_calculate_share_size_extreme_tight_stop(self):
+        """Test leverage limit kicks in with extremely tight stop loss"""
+        cash = 100.0
+        entry_price = 50000.0
+        stop_loss = 49990.0  # Only 0.02% away - extremely tight!
+
+        share_size = self.broker._calculate_share_size(cash, entry_price, stop_loss, risk_percentage=0.01)
+
+        # Risk per share = 10
+        # Risk amount = 100 * 0.01 = 1
+        # Risk-based shares = 1 / 10 = 0.1 (position value = 5,000)
+        # Max leverage shares = (100 * 10) / 50000 = 0.02 (position value = 1,000)
+        # Should be limited to 0.02
+
+        position_value = share_size * entry_price
+        max_position_value = cash * 10.0
+
+        assert position_value <= max_position_value, f"Position {position_value} exceeds 10x limit {max_position_value}"
+
+        # Verify it's actually the leverage limit, not risk limit
+        risk_based_shares = (cash * 0.01) / abs(entry_price - stop_loss)
+        leverage_limited_shares = (cash * 10.0) / entry_price
+
+        assert share_size <= leverage_limited_shares, "Should be leverage-limited"
+        assert share_size < risk_based_shares, "Leverage limit should be lower than risk-based"
+
+    def test_max_position_size_enforcement_long(self):
+        """Test 10x leverage limit is enforced when opening LONG position"""
+        # Use small balance to make leverage limit hit easily
+        small_broker = SimpleBroker(initial_balance=100.0, maker_commission=0.001)
+
+        # Try to open position with very tight stop (would want large position)
+        entry_price = 50000.0
+        stop_loss = 49990.0  # Extremely tight 0.02% stop
+        tp_price = 51000.0
+
+        small_broker.step(0, 1, entry_price, entry_price+100, entry_price-100, tp_price, stop_loss)
+
+        # Check position value doesn't exceed 10x balance
+        if small_broker.position_size > 0:
+            position_value = abs(small_broker.position_size) * entry_price
+            max_allowed = small_broker.initial_balance * 10.0
+
+            assert position_value <= max_allowed, f"Position {position_value} exceeds 10x leverage {max_allowed}"
+
+    def test_max_position_size_enforcement_short(self):
+        """Test 10x leverage limit is enforced when opening SHORT position"""
+        small_broker = SimpleBroker(initial_balance=100.0, maker_commission=0.001)
+
+        # Try to open SHORT with very tight stop
+        entry_price = 50000.0
+        stop_loss = 50010.0  # Extremely tight stop above entry
+        tp_price = 49000.0
+
+        small_broker.step(0, 2, entry_price, entry_price+100, entry_price-100, tp_price, stop_loss)
+
+        # Check position value doesn't exceed 10x balance
+        if small_broker.position_size != 0:
+            position_value = abs(small_broker.position_size) * entry_price
+            max_allowed = small_broker.initial_balance * 10.0
+
+            assert position_value <= max_allowed, f"Position {position_value} exceeds 10x leverage {max_allowed}"
+
+    def test_calculate_share_size_zero_stop_distance(self):
+        """Test _calculate_share_size handles zero stop distance gracefully"""
+        cash = 10000.0
+        entry_price = 50000.0
+        stop_loss = 50000.0  # Same as entry (invalid)
+
+        share_size = self.broker._calculate_share_size(cash, entry_price, stop_loss)
+
+        # Should return 0 when stop distance is 0
+        assert share_size == 0.0, "Should return 0 for zero stop distance"

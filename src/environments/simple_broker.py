@@ -1,7 +1,6 @@
 import math
 import numpy as np
 from typing import Dict
-from copy import deepcopy
 
 
 class SimpleBroker:
@@ -248,7 +247,7 @@ class SimpleBroker:
             'exit_commission_type': commission_type,
             'duration': self.current_step - last_trade.get('step_open', 0),
             'pnl': true_pnl,
-            'pnl_percent': (true_pnl / self.used_balance) * 100 if self.used_balance else 0,
+            'pnl_percent': (true_pnl / self.current_balance) * 100,
             'reason': reason
         })
 
@@ -296,8 +295,15 @@ class SimpleBroker:
         if max_shares_by_risk <= 0:
             return 0.0
 
+        # Limit to 10x leverage (max position value = 10x available balance)
+        max_position_value = cash * 10.0
+        max_shares_by_leverage = max_position_value / entry_price
+
+        # Take the minimum of risk-based and leverage-based limits
+        max_shares = min(max_shares_by_risk, max_shares_by_leverage)
+
         # Floor to nearest precision
-        floored_size = math.floor(max_shares_by_risk / self.quantity_precision) * self.quantity_precision
+        floored_size = math.floor(max_shares / self.quantity_precision) * self.quantity_precision
 
         # Ensure minimum viable position size
         min_position_value = entry_price * self.quantity_precision
@@ -483,7 +489,6 @@ class SimpleBroker:
             'stop_loss_price': self.stop_loss_price,
             'take_profit_price': self.take_profit_price,
             'performance': self.performance,
-            'trades': deepcopy(self.trade_history),  # Deep copy to prevent state mutation
         })
 
     def get_state(self) -> Dict:

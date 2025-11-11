@@ -17,7 +17,7 @@ from collections import deque
 class EnhancedVolumeProfile:
     """Volume Profile calculator - session-based, clean architecture."""
 
-    def __init__(self, n_bins=100, lookback_window=288, device="cpu", session_start_hour=0):
+    def __init__(self, n_bins=100, lookback_window=288, device="cuda", session_start_hour=0):
         self.device = torch.device(device)
         self.n_bins = n_bins
         self.lookback_window = lookback_window

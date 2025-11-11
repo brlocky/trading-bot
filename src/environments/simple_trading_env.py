@@ -1,60 +1,60 @@
 """
-SimpleTradingEnv - Multi-Input Trading Environment (Optimized Architecture)
+SimpleTradingEnv - Multi-Input Trading Environment (Multi-Scale Architecture)
 
-Uses 6 feature groups with semantic separation for optimal learning:
+Uses 6 feature groups with temporal/spatial separation for optimal learning:
 
-1. Price Patterns (8): Candle structure, volume, multi-TF returns [CNN]
-   - Temporal sequences processed by Conv1d for pattern detection
-2. Market Context (6): EMA/VWAP distances, volatility [MLP]
-   - Current market positioning (last timestep only)
-3. Trend Indicators (10): EMA slopes, crossovers, momentum [MLP]
-   - Current trend state (last timestep only)
-4. Trading Sessions (3): Asia/London/NY flags [Linear]
-   - Current session (last timestep only)
-5. Account State (5): Balance, equity, PnL, commission [MLP]
+1. Micro Temporal (5): OHLC + Volume [Small-kernel CNN]
+   - Fine-grained price movements, temporal patterns
+2. Micro Spatial (4): Body/wick ratios [MLP]
+   - Candle structure, no temporal dependency
+3. Meso Patterns (2): 1h, 4h returns [Medium-kernel CNN]
+   - Intraday trends
+4. Macro Patterns (1): 24h return [Large-kernel CNN]
+   - Daily trends
+5. Account State (5): Balance, equity, PnL [MLP]
    - Current account metrics
-6. Position Info (7): Status, leverage, distances, risk-reward [MLP]
+6. Position Info (7): Status, leverage, SL/TP distances [MLP]
    - Current position state
 
-Total: 39 features per timestep
-Architecture: 1 CNN encoder + 5 MLP/Linear encoders -> 256-dim fused features
+Total: 24 features per timestep (price patterns) + 12 features (trading state)
+Architecture: Multi-scale CNN (3 scales) + GNN (optional) + 2 MLPs -> fused features
 
-Action Space: MultiDiscrete([4, 10, 10]) - [Direction, Risk-Reward Ratio, ATR Multiplier]
+Action Space: MultiDiscrete([4]) - [Direction: HOLD/LONG/SHORT/CLOSE]
 """
 
+from copy import deepcopy
 import gymnasium as gym
 import torch
 import numpy as np
 import pandas as pd
 from gymnasium.spaces import MultiDiscrete
 from environments import SimpleBroker
-from environments.generic_trading_visualizer import GenericTradingVisualizer, create_advanced_config
-from features.enhanced_volume_profile import EnhancedVolumeProfile
 from data_processing.enhanced_features import (
     get_account_state_features,
     get_position_info_features,
-    precompute_price_patterns_features,
-    precompute_market_context_features,
-    precompute_trend_features,
-    precompute_trading_sessions
+    precompute_micro_temporal_features,
+    precompute_micro_spatial_features,
+    precompute_meso_patterns_features,
+    precompute_macro_patterns_features,
 )
 from utils.PivotsSLTPCalculator import PivotSLTPCalculator
-
 from utils.indicator_utils import add_indicators
 
 
 class SimpleTradingEnv(gym.Env):
     """
-    Multi-Input Trading Environment (Phase 2: Divergence Detection)
+    Multi-Input Trading Environment with Multi-Scale Feature Separation
 
-    Dual CNN perspectives + divergence CNNs + minimal high-signal features.
-    Total: 134 features + 50 VP bins = 184 features
+    Separates features by temporal scale and processing type:
+    - Temporal features (time-series) → CNN encoders
+    - Spatial features (per-candle structure) → MLP encoder
+    - Trading state (account/position) → MLP encoders
     """
 
     def __init__(
         self, data, initial_balance=10000, lookback_window=288,
         n_bins=50, device="cuda", render_mode='human',
-        enable_pattern_memory=True, reward_min=-200.0, reward_max=200.0
+        enable_pattern_memory=False
     ):
         super().__init__()
 
@@ -68,12 +68,13 @@ class SimpleTradingEnv(gym.Env):
         # Add technical indicators if not already present
         self.data['date'] = pd.to_datetime(self.data['date_close'])
         add_indicators(self.data)
+        intial_data_len = len(self.data)
         self.data = self.data.dropna().reset_index(drop=True)
+        data_len_after_na = len(self.data)
+        if data_len_after_na < intial_data_len:
+            print(f"Info: Dropped {intial_data_len - data_len_after_na} rows due to NaNs after adding indicators.")
 
-        # Reward normalization bounds (min-max scaling to [-1, 1])
-        self.reward_min = reward_min
-        self.reward_max = reward_max
-        self.reward_range_size = reward_max - reward_min
+        self.data_len = len(self.data)
 
         # Initialize pattern memory
         self.enable_pattern_memory = enable_pattern_memory
@@ -86,10 +87,27 @@ class SimpleTradingEnv(gym.Env):
         self.episode_return = 0.0
 
         # Prepare data with all features - pre-compute all static features (modifies in place)
-        self.price_patterns_cols = precompute_price_patterns_features(self.data, window=lookback_window)
-        self.market_context_cols = precompute_market_context_features(self.data, window=lookback_window)
-        self.trend_feature_cols = precompute_trend_features(self.data)
-        self.trading_session_cols = precompute_trading_sessions(self.data)
+        self.micro_temporal_cols = precompute_micro_temporal_features(self.data, window=lookback_window)
+        self.micro_spatial_cols = precompute_micro_spatial_features(self.data, window=lookback_window)
+        self.meso_cols = precompute_meso_patterns_features(self.data, window=lookback_window)
+        self.macro_cols = precompute_macro_patterns_features(self.data, window=lookback_window)
+
+        # Pre-convert price features to tensors (avoid DataFrame→NumPy→Tensor conversion on every step)
+        self.micro_temporal_tensor = torch.from_numpy(
+            self.data[self.micro_temporal_cols].values.astype(np.float32)
+        ).to(device)
+
+        self.micro_spatial_tensor = torch.from_numpy(
+            self.data[self.micro_spatial_cols].values.astype(np.float32)
+        ).to(device)
+
+        self.meso_tensor = torch.from_numpy(
+            self.data[self.meso_cols].values.astype(np.float32)
+        ).to(device)
+
+        self.macro_tensor = torch.from_numpy(
+            self.data[self.macro_cols].values.astype(np.float32)
+        ).to(device)
 
         # Action space: [direction, risk_reward_ratio, atr_multiplier]
         # - direction: 0=HOLD, 1=LONG, 2=SHORT, 3=CLOSE
@@ -99,24 +117,24 @@ class SimpleTradingEnv(gym.Env):
         self.action_space = MultiDiscrete([4])
 
         self.observation_space = gym.spaces.Dict({
-            'price_patterns': gym.spaces.Box(
+            'micro_temporal': gym.spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(lookback_window, len(self.price_patterns_cols)),
+                shape=(lookback_window, len(self.micro_temporal_cols)),
                 dtype=np.float32
             ),
-            'market_context': gym.spaces.Box(
+            'micro_spatial': gym.spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(lookback_window, len(self.market_context_cols)),
+                shape=(lookback_window, len(self.micro_spatial_cols)),
                 dtype=np.float32
             ),
-            'trend_indicators': gym.spaces.Box(
+            'meso_patterns': gym.spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(lookback_window, len(self.trend_feature_cols)),
+                shape=(lookback_window, len(self.meso_cols)),
                 dtype=np.float32
             ),
-            'trading_sessions': gym.spaces.Box(
-                low=0, high=1,
-                shape=(lookback_window, len(self.trading_session_cols)),
+            'macro_patterns': gym.spaces.Box(
+                low=-np.inf, high=np.inf,
+                shape=(lookback_window, len(self.macro_cols)),
                 dtype=np.float32
             ),
             'account_state': gym.spaces.Box(
@@ -133,7 +151,7 @@ class SimpleTradingEnv(gym.Env):
 
         # Initialize broker, volume profile, and zigzag state
         self.broker = SimpleBroker(initial_balance=self.initial_balance, quantity_precision=0.001)
-        self.vp = EnhancedVolumeProfile(n_bins=n_bins, lookback_window=lookback_window, device=device)
+        # self.vp = EnhancedVolumeProfile(n_bins=n_bins, lookback_window=lookback_window, device=device)
 
         self.reset()
 
@@ -152,10 +170,7 @@ class SimpleTradingEnv(gym.Env):
         self.current_step = self.lookback_window
         self.history = []
         self.broker.reset()
-        self.vp.reset()
-
-        # Initialize reward tracking
-        self.steps_since_close = 0
+        # self.vp.reset()
 
         # Warm up the broker and volume profile
         for i in range(self.lookback_window):
@@ -181,8 +196,8 @@ class SimpleTradingEnv(gym.Env):
         # risk_reward_ratio = 1.0 + (rr_idx * 1.0)  # Maps 0-9 to 1.0-10.0
         # tr_multiplier = 2.0 + (atr_idx * 0.3)    # Maps 0-9 to 2.0-4.7 (wider SL)
         direction_action = int(action[0])
-        risk_reward_ratio = 5
-        atr_multiplier = 2
+        risk_reward_ratio = 2.5
+        atr_multiplier = 2.0
 
         # Convert to actual prices
         current_price = self.data['close'].iloc[self.current_step].item()
@@ -190,6 +205,7 @@ class SimpleTradingEnv(gym.Env):
         current_price_low = self.data['low'].iloc[self.current_step].item()
 
         previous_state = self.broker.get_state()
+        previous_trades = deepcopy(self.broker.trade_history)
 
         # Calculate SL/TP only for LONG and SHORT actions
         sl_price, tp_price = PivotSLTPCalculator.calculate_sl_tp(
@@ -214,12 +230,9 @@ class SimpleTradingEnv(gym.Env):
         )
 
         current_state = self.broker.get_state()
+        current_trades = self.broker.trade_history
 
-        reward = self.calculate_reward(direction_action, current_state, previous_state)
-
-        # Normalize reward using min-max scaling to [-1, 1]
-        raw_reward = reward
-        reward = self._normalize_reward_minmax(reward)
+        reward = self.calculate_reward(direction_action, current_trades, previous_trades, current_state, previous_state)
 
         # Track transition for pattern memory
         if self.enable_pattern_memory:
@@ -227,17 +240,16 @@ class SimpleTradingEnv(gym.Env):
                 'step': self.current_step,
                 'action': action,
                 'reward': reward,           # Normalized reward
-                'raw_reward': raw_reward,   # Keep raw for analysis
                 'info': current_state.copy()
             })
             self.episode_return += reward
 
         done = False
-        truncated = False        # More lenient bankruptcy check - only stop if truly bankrupt (< 5% of initial)
+        truncated = False
         if self.broker.is_bankrupt:
             print("Account bankrupt!")
             done = True
-            reward -= 100.0  # Large penalty for bankruptcy
+            # Bankruptcy penalty already applied in calculate_reward() - don't double penalize
 
         self.history.append({
             "step": self.current_step,
@@ -263,37 +275,25 @@ class SimpleTradingEnv(gym.Env):
 
     def _get_obs(self):
         """
-        Generate multi-input observation with 6 feature groups.
+        Generate multi-input observation with multi-scale feature groups.
 
         Groups:
-        1. Price Patterns (8): Temporal sequences for CNN
-        2. Market Context (6): Current positioning (last timestep)
-        3. Trend Indicators (10): Current trend state (last timestep)
-        4. Trading Sessions (3): Current session (last timestep)
-        5. Account State (5): Current account metrics
-        6. Position Info (7): Current position state
+        1. Micro Temporal (5): OHLC + Volume → Small kernel CNN
+        2. Micro Spatial (4): Candle structure → MLP (last timestep)
+        3. Meso Patterns (2): Intraday trends → Medium kernel CNN
+        4. Macro Patterns (1): Daily trends → Large kernel CNN
+        5. Account State (5): Current account metrics → MLP
+        6. Position Info (7): Current position state → MLP
         """
         start_idx = max(0, self.current_step - self.lookback_window)
         end_idx = self.current_step
 
-        # Get data slice
-        df_slice = self.data.iloc[start_idx:end_idx].copy()
-
-        # Group 1: Price Patterns (for CNN temporal processing)
-        price_patterns = df_slice[self.price_patterns_cols].values
-        price_patterns = torch.tensor(price_patterns, dtype=torch.float32, device=self.device)
-
-        # Group 2: Market Context (current positioning)
-        market_context = df_slice[self.market_context_cols].values
-        market_context = torch.tensor(market_context, dtype=torch.float32, device=self.device)
-
-        # Group 3: Trend Indicators
-        trend_indicators = df_slice[self.trend_feature_cols].values
-        trend_indicators = torch.tensor(trend_indicators, dtype=torch.float32, device=self.device)
-
-        # Group 4: Trading Sessions
-        trading_sessions = df_slice[self.trading_session_cols].values
-        trading_sessions = torch.tensor(trading_sessions, dtype=torch.float32, device=self.device)
+        # Group 1-4: Multi-scale price patterns (tensor slicing + zero-copy conversion)
+        # Use contiguous() to ensure efficient memory layout after slicing
+        micro_temporal = self.micro_temporal_tensor[start_idx:end_idx].contiguous()
+        micro_spatial = self.micro_spatial_tensor[start_idx:end_idx].contiguous()
+        meso_patterns = self.meso_tensor[start_idx:end_idx].contiguous()
+        macro_patterns = self.macro_tensor[start_idx:end_idx].contiguous()
 
         # Group 5: Account State
         account_state = get_account_state_features(
@@ -308,12 +308,12 @@ class SimpleTradingEnv(gym.Env):
             self.lookback_window,
         ).to(self.device)
 
-        # Build observation dictionary
-        obs_dict = {
-            'price_patterns': price_patterns,
-            'market_context': market_context,
-            'trend_indicators': trend_indicators,
-            'trading_sessions': trading_sessions,
+        # Build observation dictionary (will be converted to numpy arrays below)
+        obs_dict: dict = {  # type: ignore - will contain numpy arrays after conversion
+            'micro_temporal': micro_temporal,
+            'micro_spatial': micro_spatial,
+            'meso_patterns': meso_patterns,
+            'macro_patterns': macro_patterns,
             'account_state': account_state,
             'position_info': position_info,
         }
@@ -336,170 +336,83 @@ class SimpleTradingEnv(gym.Env):
                 print(f"  min={tensor_min:.4f} at indices {min_idx[:5]}{'...' if len(min_idx) > 5 else ''}")
                 print(f"  max={tensor_max:.4f} at indices {max_idx[:5]}{'...' if len(max_idx) > 5 else ''}")
 
-            # Convert to CPU NumPy array for Stable-Baselines3
-            obs_dict[key] = tensor.cpu().numpy().astype(np.float32)
+            # Convert to NumPy array for Stable-Baselines3 (minimize copies)
+            if tensor.is_cuda:
+                obs_dict[key] = tensor.cpu().numpy().astype(np.float32)
+            else:
+                obs_dict[key] = tensor.numpy().astype(np.float32)
 
         return obs_dict
 
-    def _normalize_reward_minmax(self, reward):
+    def calculate_reward(self, action, current_trades, previous_trades, current_state, previous_state):
         """
-        Normalize reward to [-1, 1] using symmetric scaling around zero
+        REWARD FUNCTION v30 - AGGRESSIVE EXPLORATION + SHAPED REWARDS
 
-        This ensures 0 reward → 0 normalized (centered)
-        Positive rewards → [0, 1]
-        Negative rewards → [-1, 0]
-
-        Args:
-            reward: Raw reward value
-
-        Returns:
-            Normalized reward in [-1, 1] range
-        """
-        # Handle edge case
-        if reward == 0:
-            return 0.0
-
-        # Normalize positive and negative rewards separately (symmetric around 0)
-        if reward > 0:
-            # Positive: scale [0, reward_max] → [0, 1]
-            normalized = reward / self.reward_max
-        else:
-            # Negative: scale [reward_min, 0] → [-1, 0]
-            normalized = reward / abs(self.reward_min)
-
-        # Clip to ensure bounds (handles extreme outliers)
-        return float(np.clip(normalized, -1.0, 1.0))
-
-    def calculate_reward(self, direction, current_state, previous_state):
-        """
-        REWARD FUNCTION v24 - ENCOURAGING ACTIVE TRADING
-
-        Key Changes from v23:
-        - INCREASED exploration bonus: 2.0 → 10.0 (encourage trading)
-        - REDUCED SL penalties: -15-30 → -10-20 (less fear of losses)
-        - ADDED idle penalty: -0.5 per step when flat (discourage excessive HOLDing)
-        - Kept balance-focused rewards and TP bonuses
-        - Kept redundant action penalty (-50)
+        Changes from v29:
+        - Increased exploration bonus: 0.1 → 0.3
+        - Added position holding reward: +0.01/step when in position
+        - Increased balance change scaling: 30x → 100x
+        - Reduced invalid action penalties
         """
         if previous_state is None:
             return 0.0
 
         reward = 0.0
-
-        # === 0. REDUNDANT ACTION PENALTY (CRITICAL FOR DISCRETE BOT) ===
-        # Penalize trying to open LONG when already LONG, or SHORT when already SHORT
-        previous_position = previous_state.get('position_size', 0)
+        current_balance = current_state.get('equity', 0)
+        previous_balance = previous_state.get('equity', 0)
         current_position = current_state.get('position_size', 0)
+        previous_position = previous_state.get('position_size', 0)
 
-        # Check if position didn't change (means action was ignored by broker)
-        if previous_position != 0 and current_position == previous_position:
-            # Get the last action from history
-            if direction != 0:  # IF not HOLD
-                # HARD PENALTY: Agent should learn to use HOLD or CLOSE instead
-                reward -= 50.0
-
-        # === 1. BALANCE CHANGE (PRIMARY GOAL) ===
-        # Track balance (not equity) to reward only REALIZED gains
-        current_balance = current_state.get('current_balance')
-        previous_balance = previous_state.get('current_balance')
+        # === 1. BALANCE CHANGE (AMPLIFIED!) ===
         balance_change = current_balance - previous_balance
+        balance_change_pct = balance_change / self.initial_balance
 
-        # Strong multiplier - balance growth is the main objective
-        if balance_change != 0:
-            reward += balance_change * 0.5  # 50% of dollar change as reward
+        # INCREASED: Scale balance change more aggressively
+        # Typical 1% change → ±1.0 reward (was ±0.3)
+        balance_reward = balance_change_pct * 100.0
+        balance_reward = float(np.clip(balance_reward, -1.0, 1.0))
+        reward += balance_reward
 
-        # === 1. TRADE COMPLETION REWARDS (SECONDARY SIGNAL) ===
-        current_trades = current_state.get('trades', [])
-        previous_trades = previous_state.get('trades', [])
+        # === 2. POSITION HOLDING REWARD ===
+        # Reward for being in a position (encourages action)
+        if current_position != 0 and previous_position != 0:
+            reward += 0.1  # Small reward per step in position
+
+        # === 3. TRADE COMPLETION REWARDS ===
         current_closed = [t for t in current_trades if t.get('status') == 'CLOSED']
         previous_closed = [t for t in previous_trades if t.get('status') == 'CLOSED']
 
         if len(current_closed) > len(previous_closed):
             new_trade = current_closed[-1]
-            pnl_percent = new_trade.get('pnl_percent', 0)
-            duration = new_trade.get('duration', 0)
             reason = new_trade.get('reason', 'Unknown')
 
-            # Note: Balance change already rewarded above, this adds trade-specific bonuses
-
             if 'TP' in reason:
-                # Big reward for TP hits (scales with profit)
-                base_reward = 50.0 + abs(pnl_percent) * 10.0
-
-                # Duration bonus: FAST TP = EXCELLENT! Slow TP = less capital efficient
-                if duration <= 10:
-                    duration_bonus = 1.5  # BONUS for quick wins (1-10 bars)
-                elif duration <= 50:
-                    duration_bonus = 1.2  # Good for medium-term (11-50 bars)
-                elif duration <= 100:
-                    duration_bonus = 1.0  # Neutral (51-100 bars)
-                else:
-                    duration_bonus = 0.8  # Slight penalty for very slow TPs (>100 bars)
-
-                reward += base_reward * duration_bonus
+                reward += 1.0  # Maximum reward
 
             elif 'SL' in reason:
-                # Reduced penalty for SL (was 15-30, now 10-20)
-                penalty = 10.0 + abs(pnl_percent) * 2.0  # Reduced multiplier from 3.0
-
-                # Extra penalty for very quick losses
-                if duration < 5:
-                    penalty *= 1.5  # Hit SL too fast = bad trade
-
-                reward -= penalty
+                reward += -0.5  # 2:1 ratio
 
             else:  # Manual close
-                # Penalize manual closes unless profitable
-                if pnl_percent > 1.0:  # Only reward if >1% profit
-                    reward += 10.0 + pnl_percent * 5.0
-                elif pnl_percent > 0:
-                    reward += 2.0  # Small reward for small profit
-                else:
-                    # Penalty for closing at loss
-                    reward -= 10.0 + abs(pnl_percent) * 2.0
+                reward += -0.05
 
-        # === 2. EXPLORATION BONUS (Increased to encourage trading) ===
-        current_position = current_state.get('position_size', 0)
-        previous_position = previous_state.get('position_size', 0)
-
+        # === 4. EXPLORATION INCENTIVES (INCREASED!) ===
+        # Opening new position bonus - TRIPLED!
         if previous_position == 0 and current_position != 0:
-            reward += 10.0  # Increased from 2.0 - significant reward for taking action
+            reward += 0.3  # Was 0.1
 
-        # === 2b. IDLE PENALTY (Discourage excessive HOLDing) ===
-        if current_position == 0 and previous_position == 0:
-            reward -= 0.5  # Small penalty for staying flat
+        # === 5. REDUCED INVALID ACTION PENALTIES ===
+        # Very small penalties - don't discourage exploration
+        if action == 3 and previous_position == 0:
+            reward -= 0.1  # Was 0.05
 
-        # === 3. POSITION MANAGEMENT (Encourage holding winners) ===
-        if current_position != 0:
-            unrealized_pnl = current_state.get('unrealized_pnl', 0)
-            used_balance = current_state.get('used_balance', 1)
-            unrealized_pct = (unrealized_pnl / used_balance * 100) if used_balance > 0 else 0
+        if action in [1, 2] and previous_position != 0:
+            reward -= 0.1  # Was 0.1
 
-            # Reward holding winning positions
-            if unrealized_pct > 1.0:
-                reward += min(unrealized_pct * 0.3, 3.0)  # Small capped reward
-
-            # Penalize deep drawdowns
-            elif unrealized_pct < -3.0:
-                reward += unrealized_pct * 0.3  # Negative value
-
-            # Between -3% and +1%: NEUTRAL
-
-        else:
-            # Track inaction when flat
-            self.steps_since_close += 1
-
-            # Penalize excessive inaction (>500 steps = ~42 hours)
-            if self.steps_since_close > 500:
-                inaction_penalty = min((self.steps_since_close - 500) * 0.02, 15.0)
-                reward -= inaction_penalty
-
-        # === 4. BANKRUPTCY PENALTY ===
+        # === 6. BANKRUPTCY PENALTY ===
         if self.broker.is_bankrupt:
-            reward = -500.0
+            reward = -1.0
 
-        # Clip to prevent extreme values
-        return float(np.clip(reward, -500.0, 500.0))
+        return reward
 
     def _create_episode_summary(self):
         """Create summary of episode for pattern memory"""
@@ -523,22 +436,3 @@ class SimpleTradingEnv(gym.Env):
                 'avg_volume': float(self.data['volume'].iloc[start_idx:end_idx].mean()),
             }
         }
-
-    def render(self):
-        visualizer = GenericTradingVisualizer(subplot_config=create_advanced_config())
-
-        # Prepare indicators - just pass the volume profile object
-        indicators = {
-            'volume_profile': self.vp,  # Pass the entire EnhancedVolumeProfile object
-            'history_data': getattr(self, 'history', [])
-        }
-
-        frame = visualizer.plot_data(
-            data=self.data,
-            trade_history=self.broker.step_history,
-            indicators=indicators,
-            current_step=self.current_step,
-            lookback_window=getattr(self, 'lookback_window', 100),
-            title=f"Trading Environment - Step {self.current_step}"
-        )
-        return frame

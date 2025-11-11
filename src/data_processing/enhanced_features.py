@@ -1,18 +1,19 @@
 """
-Enhanced feature extraction - Optimized Architecture
+Enhanced feature extraction - Multi-Scale Architecture
 
-Feature Groups (6 groups, 39 features total):
-1. Price Patterns (8): Candle structure, volume, multi-TF returns [CNN]
-2. Market Context (6): EMA/VWAP distances, volatility [MLP]
-3. Trend Indicators (10): EMA slopes, crossovers, momentum [MLP]
-4. Trading Sessions (3): Asia/London/NY flags [Linear]
-5. Account State (5): Balance, equity, PnL, commission [MLP]
+Feature Groups (6 groups, 24 features total):
+1. Micro Temporal (5): OHLC + Volume [CNN - Small kernels]
+2. Micro Spatial (4): Body/wick ratios [MLP - Last timestep]
+3. Meso Patterns (2): 1h, 4h returns [CNN - Medium kernels]
+4. Macro Patterns (1): 24h return [CNN - Large kernels]
+5. Account State (5): Bounded growth/velocity features [MLP]
 6. Position Info (7): Position status, leverage, distances [MLP]
 
 Architecture rationale:
-- Group 1 (Price Patterns): Temporal sequences → CNN processes patterns over time
-- Groups 2-6: Current state only → MLPs process last timestep
-- Semantic separation: "price action" vs "market positioning" vs "trading state"
+- Groups 1,3,4 (Temporal features): Sequences → CNN processes patterns over time
+- Group 2 (Spatial features): Per-candle structure → MLP processes last timestep
+- Groups 5,6 (Trading state): Current state only → MLPs process last timestep
+- Separation: Temporal (time-series) vs Spatial (per-candle) vs State (account/position)
 """
 
 import pandas as pd
@@ -20,41 +21,101 @@ import numpy as np
 import torch
 
 
-def precompute_price_patterns_features(df: pd.DataFrame, window: int = 288) -> list[str]:
+def precompute_micro_temporal_features(df: pd.DataFrame, window: int = 288) -> list[str]:
     """
-    Pre-compute pure price pattern features for CNN temporal processing.
+    Pre-compute micro temporal features (OHLC + Volume sequences).
 
-    Returns 8 features (all temporal sequences benefit from Conv1d):
-    - 4 candle structure (0-1): body, upper wick, lower wick, close position
-    - 1 volume (0-1): normalized volume
-    - 3 multi-timeframe returns (bounded): 1h, 4h, 24h momentum
+    Computes 5 features - TRUE TIME SERIES:
+    - 4 normalized OHLC (0-1): Price movement over time
+    - 1 normalized volume (0-1): Trading activity over time
 
-    These features capture price action patterns and momentum at different scales.
+    These benefit from CNN temporal processing (kernels detect patterns across time).
+    Modifies df in place, returns column names.
     """
-    feature_cols = []
+    temporal_cols = []
+
+    # Normalized OHLC (rolling window 0-1 scale)
+    rolling_min = df[['open', 'high', 'low', 'close']].rolling(window=window, min_periods=1).min().min(axis=1)
+    rolling_max = df[['open', 'high', 'low', 'close']].rolling(window=window, min_periods=1).max().max(axis=1)
+    rolling_range = (rolling_max - rolling_min).replace(0, 1e-6)
+
+    df['open_norm'] = (df['open'] - rolling_min) / rolling_range
+    df['high_norm'] = (df['high'] - rolling_min) / rolling_range
+    df['low_norm'] = (df['low'] - rolling_min) / rolling_range
+    df['close_norm'] = (df['close'] - rolling_min) / rolling_range
+    temporal_cols.extend(['open_norm', 'high_norm', 'low_norm', 'close_norm'])
+
+    # Normalized volume (0-1 range)
+    volume_rolling_min = df['volume'].rolling(window=window, min_periods=1).min()
+    volume_rolling_max = df['volume'].rolling(window=window, min_periods=1).max()
+    volume_rolling_range = (volume_rolling_max - volume_rolling_min).replace(0, 1e-6)
+    df['volume_norm'] = (df['volume'] - volume_rolling_min) / volume_rolling_range
+    temporal_cols.append('volume_norm')
+
+    return temporal_cols
+
+
+def precompute_micro_spatial_features(df: pd.DataFrame, window: int = 288) -> list[str]:
+    """
+    Pre-compute micro spatial features (per-candle structure).
+
+    Computes 4 features - SPATIAL (no temporal dependency):
+    - Body ratio: Size of candle body
+    - Upper wick ratio: Top wick size
+    - Lower wick ratio: Bottom wick size
+    - Close position: Where close is within range
+
+    These describe individual candles, no time relationship.
+    Best processed by MLP (last timestep) or simple aggregation.
+    Modifies df in place, returns column names.
+    """
+    spatial_cols = []
 
     # Candle structure (natural ratios 0-1)
     df['body_ratio'] = (df['close'] - df['open']).abs() / (df['high'] - df['low']).replace(0, 1e-6)
     df['upper_wick_ratio'] = (df['high'] - df[['close', 'open']].max(axis=1)) / (df['high'] - df['low']).replace(0, 1e-6)
     df['lower_wick_ratio'] = (df[['close', 'open']].min(axis=1) - df['low']) / (df['high'] - df['low']).replace(0, 1e-6)
     df['close_position'] = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-6)
-    feature_cols.extend(['body_ratio', 'upper_wick_ratio', 'lower_wick_ratio', 'close_position'])
+    spatial_cols.extend(['body_ratio', 'upper_wick_ratio', 'lower_wick_ratio', 'close_position'])
 
-    # Volume (rolling window normalization to 0-1 range)
-    volume_rolling_min = df['volume'].rolling(window=window, min_periods=1).min()
-    volume_rolling_max = df['volume'].rolling(window=window, min_periods=1).max()
-    volume_rolling_range = (volume_rolling_max - volume_rolling_min).replace(0, 1e-6)
-    df['volume_norm'] = (df['volume'] - volume_rolling_min) / volume_rolling_range
-    feature_cols.append('volume_norm')
+    return spatial_cols
+
+
+def precompute_meso_patterns_features(df: pd.DataFrame, window: int = 288) -> list[str]:
+    """
+    Pre-compute meso pattern features (intraday trends, medium-frequency).
+
+    Computes 2 features:
+    - 1h return (bounded): Short-term trend (4 candles)
+    - 4h return (bounded): Medium-term trend (16 candles)
+
+    Modifies df in place, returns column names.
+    """
+    meso_cols = []
 
     # Multi-timeframe returns (bounded via tanh)
-    # 1h = 4 candles (15min), 4h = 16 candles, 24h = 96 candles
-    df['returns_1h'] = np.tanh(df['close'].pct_change(periods=4).fillna(0) * 100)  # Scale by 100 for sensitivity
+    df['returns_1h'] = np.tanh(df['close'].pct_change(periods=4).fillna(0) * 100)
     df['returns_4h'] = np.tanh(df['close'].pct_change(periods=16).fillna(0) * 100)
-    df['returns_24h'] = np.tanh(df['close'].pct_change(periods=96).fillna(0) * 100)
-    feature_cols.extend(['returns_1h', 'returns_4h', 'returns_24h'])
+    meso_cols.extend(['returns_1h', 'returns_4h'])
 
-    return feature_cols
+    return meso_cols
+
+
+def precompute_macro_patterns_features(df: pd.DataFrame, window: int = 288) -> list[str]:
+    """
+    Pre-compute macro pattern features (daily trends, low-frequency).
+
+    Computes 1 feature:
+    - 24h return (bounded): Long-term trend (96 candles)
+
+    Modifies df in place, returns column names.
+    """
+    macro_cols = []
+
+    df['returns_24h'] = np.tanh(df['close'].pct_change(periods=96).fillna(0) * 100)
+    macro_cols.append('returns_24h')
+
+    return macro_cols
 
 
 def precompute_market_context_features(df: pd.DataFrame, window: int = 288) -> list[str]:
@@ -132,14 +193,20 @@ def precompute_temporal_price_normalized_features(df: pd.DataFrame, window: int 
 
 
 def precompute_trend_features(df: pd.DataFrame) -> list[str]:
-    """Pre-compute trend indicator features."""
+    """
+    Pre-compute trend indicator features with proper normalization.
+
+    All slopes bounded via tanh, crossovers as discrete signals.
+    These features show temporal momentum patterns → should use CNN encoder.
+    """
     feature_cols = []
 
-    # EMA Slopes
-    df['ema9_slope'] = df['ema9'].pct_change(periods=2).fillna(0)
-    df['ema21_slope'] = df['ema21'].pct_change(periods=2).fillna(0)
-    df['ema50_slope'] = df['ema50'].pct_change(periods=2).fillna(0)
-    df['ema100_slope'] = df['ema100'].pct_change(periods=2).fillna(0)
+    # EMA Slopes (bounded via tanh)
+    # Scale by 100 to make typical 0.1% moves map to ~0.1 after tanh
+    df['ema9_slope'] = np.tanh(df['ema9'].pct_change(periods=2).fillna(0) * 100)
+    df['ema21_slope'] = np.tanh(df['ema21'].pct_change(periods=2).fillna(0) * 100)
+    df['ema50_slope'] = np.tanh(df['ema50'].pct_change(periods=2).fillna(0) * 100)
+    df['ema100_slope'] = np.tanh(df['ema100'].pct_change(periods=2).fillna(0) * 100)
     feature_cols.extend(['ema9_slope', 'ema21_slope', 'ema50_slope', 'ema100_slope'])
 
     # EMA Crossovers
@@ -148,6 +215,20 @@ def precompute_trend_features(df: pd.DataFrame) -> list[str]:
     feature_cols.extend(['ema9_21_cross', 'ema50_100_cross'])
 
     # EMA alignment - fast (9/21)
+    df['ema_alignment_fast'] = np.where(df['ema9'] > df['ema21'], 1.0, -1.0)
+    feature_cols.append('ema_alignment_fast')
+
+    # EMA alignment - slow (50/100)
+    df['ema_alignment_slow'] = np.where(df['ema50'] > df['ema100'], 1.0, -1.0)
+    feature_cols.append('ema_alignment_slow')
+
+    # EMA alignment - full (all EMAs in order)
+    bullish_alignment = (df['ema9'] > df['ema21']) & (df['ema21'] > df['ema50']) & (df['ema50'] > df['ema100'])
+    bearish_alignment = (df['ema9'] < df['ema21']) & (df['ema21'] < df['ema50']) & (df['ema50'] < df['ema100'])
+    df['ema_alignment'] = np.where(bullish_alignment, 1.0, np.where(bearish_alignment, -1.0, 0.0))
+    feature_cols.append('ema_alignment')
+
+    return feature_cols
     df['ema_alignment_fast'] = np.where(df['ema9'] > df['ema21'], 1.0, -1.0)
     feature_cols.append('ema_alignment_fast')
 
@@ -396,17 +477,17 @@ def get_volume_profile_bins(vp_obj, lookback: int, close_prices: torch.Tensor = 
 
 def get_account_state_features(broker_history: list, initial_balance: float, lookback: int) -> torch.Tensor:
     """
-    Group 6: Account State Features (5 features)
+    Group 6: Account State Features (5 features) - v2 Bounded Design
 
-    Core account metrics normalized for 100x leverage trading.
+    All features properly bounded to prevent saturation after many trades.
     Shape: (lookback, 5)
 
     Features:
-    1. equity / (initial_balance * 10) - Total account value (0.1=start, 1.0=10x)
-    2. current_balance / (initial_balance * 10) - Free balance available
-    3. unrealized_pnl / (initial_balance * 5) + 0.5 - Current trade PnL (-5x to +5x → 0-1)
-    4. realized_pnl / (initial_balance * 5) + 0.5 - Closed trades PnL (-5x to +5x → 0-1)
-    5. total_commission / (initial_balance * 5) - Cumulative fees (0 to 5x → 0-1)
+    1. equity_growth: tanh((equity / initial_balance) - 1) - Account growth from start
+    2. balance_ratio: tanh((balance / initial_balance) - 1) - Free balance growth
+    3. unrealized_pnl_pct: unrealized_pnl / used_balance - Current position P&L %
+    4. recent_pnl_velocity: tanh(sum(last_10_trades_pnl) / initial_balance) - Recent trading momentum
+    5. profit_factor_recent: min(gross_profit_50 / (gross_loss_50 + 1e-6), 5.0) / 5.0 - Win/loss ratio
     """
     history_slice = broker_history[-lookback:]
     start_idx = lookback - len(history_slice)
@@ -415,18 +496,46 @@ def get_account_state_features(broker_history: list, initial_balance: float, loo
     equities = np.array([h['equity'] for h in history_slice], dtype=np.float32)
     current_balances = np.array([h['current_balance'] for h in history_slice], dtype=np.float32)
     unrealized_pnls = np.array([h['unrealized_pnl'] for h in history_slice], dtype=np.float32)
-    realized_pnls = np.array([h['realized_pnl'] for h in history_slice], dtype=np.float32)
-    total_commissions = np.array([h['total_commission'] for h in history_slice], dtype=np.float32)
+    used_balances = np.array([h['used_balance'] for h in history_slice], dtype=np.float32)
 
     # Pre-allocate features
     features = np.zeros((lookback, 5), dtype=np.float32)
 
-    # Normalize to 0-1 range
-    features[start_idx:, 0] = equities / (initial_balance * 10.0)
-    features[start_idx:, 1] = current_balances / (initial_balance * 10.0)
-    features[start_idx:, 2] = (unrealized_pnls / (initial_balance * 5.0)) + 0.5
-    features[start_idx:, 3] = (realized_pnls / (initial_balance * 5.0)) + 0.5
-    features[start_idx:, 4] = total_commissions / (initial_balance * 5.0)  # Allow up to 5x initial balance in fees
+    # Feature 1: Equity growth (bounded via tanh)
+    # Maps: 0% → 0.0, +100% → +0.76, -50% → -0.46
+    features[start_idx:, 0] = np.tanh((equities / initial_balance) - 1.0)
+
+    # Feature 2: Balance ratio (bounded via tanh)
+    features[start_idx:, 1] = np.tanh((current_balances / initial_balance) - 1.0)
+
+    # Feature 3: Unrealized PnL % of position margin
+    # Natural ratio: typically ±10% (0.1x leverage), can spike to ±100% with 10x leverage
+    unrealized_pct = np.divide(
+        unrealized_pnls,
+        used_balances,
+        out=np.zeros_like(unrealized_pnls),
+        where=(used_balances > 0)
+    )
+    features[start_idx:, 2] = unrealized_pct
+
+    # Feature 4 & 5: Recent PnL velocity and profit factor (computed per timestep from trade history)
+    for i, history_state in enumerate(history_slice):
+        # Extract all_pnls from the trades in this state
+        trades = history_state.get('trades', [])
+        closed_trades = [t for t in trades if t['status'] == 'CLOSED']
+        all_pnls = [t['pnl'] for t in closed_trades]
+
+        # Feature 4: Recent PnL velocity (last 10 trades)
+        recent_10 = all_pnls[-10:] if len(all_pnls) >= 10 else all_pnls
+        recent_pnl_sum = sum(recent_10)
+        features[start_idx + i, 3] = np.tanh(recent_pnl_sum / initial_balance)
+
+        # Feature 5: Profit factor (last 50 trades)
+        recent_50 = all_pnls[-50:] if len(all_pnls) >= 50 else all_pnls
+        gross_profit_50 = sum(pnl for pnl in recent_50 if pnl > 0)
+        gross_loss_50 = sum(abs(pnl) for pnl in recent_50 if pnl < 0)
+        profit_factor = gross_profit_50 / (gross_loss_50 + 1e-6)
+        features[start_idx + i, 4] = min(profit_factor, 5.0) / 5.0  # Cap at 5.0, normalize to [0, 1]
 
     return torch.from_numpy(features)
 
@@ -464,9 +573,9 @@ def get_position_info_features(broker_history: list, lookback: int) -> torch.Ten
     # Pre-allocate output
     features = np.zeros((lookback, 7), dtype=np.float32)
 
-    # Feature 1: Position status (0/0.5/1.0)
-    features[start_idx:, 0] = np.where(position_sizes > 0, 0.5,
-                                       np.where(position_sizes < 0, 1.0, 0.0))
+    # Feature 1: Position direction (-1.0=SHORT, 0.0=FLAT, +1.0=LONG)
+    # This matches the broker's direction field and is symmetrical
+    features[start_idx:, 0] = np.sign(position_sizes)  # Returns -1, 0, or +1
 
     # Feature 2: Leverage used (normalized by 100x max)
     leverage = used_balances / equities

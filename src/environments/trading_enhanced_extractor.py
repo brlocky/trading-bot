@@ -10,27 +10,33 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
     Rebalanced Multi-Input Feature Extractor - Optimized for Price Action Focus.
 
     ARCHITECTURE (6 groups):
-    1. Price Patterns CNN (64-dim) - 8 features: candle structure, volume, multi-TF returns [INCREASED]
-    2. Market Context MLP (32-dim) - 6 features: EMA/VWAP distances, volatility [INCREASED]
-    3. Trend Indicators MLP (32-dim) - 10 features: Crossovers/momentum state
-    4. Trading Sessions Linear (3-dim) - 3 features: Session encoding [REDUCED]
-    5. Account State MLP (8-dim) - 5 features: Balance/equity metrics
+    1. Price Patterns CNN (64-dim) - 8 features: candle structure, volume, multi-TF returns
+       → 4-layer CNN (kernel=5, RF~17) + Global pooling (sees all 288 timesteps)
+    2. Market Context MLP (32-dim) - 6 features: EMA/VWAP distances, volatility
+    3. Trend Indicators CNN (32-dim) - 10 features: EMA slopes/crossovers (temporal momentum)
+       → 4-layer CNN (kernel=5, RF~17) + Global pooling (sees all 288 timesteps)
+    4. Trading Sessions Linear (3-dim) - 3 features: Session encoding
+    5. Account State MLP (8-dim) - 5 features: Bounded growth/velocity features
     6. Position Info MLP (8-dim) - 7 features: Current position status
 
-    Key Changes from Previous Version:
+    Key Changes from v1:
     - Price Patterns: 32 → 64 dims (2x capacity for price action)
     - Market Context: 16 → 32 dims (2x capacity for trend positioning)
+    - Trend Indicators: MLP → 4-layer CNN (now processes temporal momentum)
     - Trading Sessions: 4 → 3 dims (reduce over-reliance on time-of-day)
+    - CNN depth: 2 → 4 layers (RF: 5 → 17 timesteps for local patterns)
     - Total embedding: 100 → 147 dims (47% increase in representation power)
 
     Design principles:
-    - CNN for temporal price patterns (candle structure, volume, returns)
-    - MLPs for current state/positioning (distances, trends, account, position)
+    - Deep CNNs for temporal patterns (price patterns, trend momentum)
+      * 4 layers with kernel=5 gives ~17 timestep receptive field (local patterns)
+      * AdaptiveAvgPool provides global context (all 288 timesteps)
+    - MLPs for current state/positioning (distances, account, position)
     - Rebalanced to prioritize price action over simple session timing
     - ReLU activation (fast and sufficient)
 
-    Total input: 39 features per timestep
-    Total output: 147-dim embeddings -> 256-dim fused features
+    Total input: 39 features per timestep × 288 timesteps
+    Total output: 147-dim embeddings → 256-dim fused features
     """
 
     def __init__(self, observation_space: spaces.Dict, hidden_dim=128, **kwargs):
@@ -44,12 +50,19 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
         # Input: [B, T, 8] - Pure price action: candle structure, volume, multi-TF returns
         # These features benefit from temporal convolution (patterns evolve over time)
         # INCREASED from 32 to 64 dims to give price patterns more representation power
+        # DEEPER architecture to increase receptive field (288 timesteps)
+        # With kernel=5 and 4 layers: receptive field = ~17 timesteps
+        # AdaptiveAvgPool sees full 288 timesteps globally
         self.price_patterns_encoder = nn.Sequential(
-            nn.Conv1d(self.shapes['price_patterns'][-1], 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),  # Increased capacity
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1)  # Pool to [B, 64, 1]
+            nn.Conv1d(self.shapes['price_patterns'][-1], 16, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(16, 32, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(64, 64, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1)  # Global pooling sees all 288 timesteps
         )
 
         # === 2. MARKET CONTEXT: Simple MLP (last timestep only) ===
@@ -58,17 +71,26 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
         # INCREASED from 16 to 32 dims for better market context representation
         self.market_context_encoder = nn.Sequential(
             nn.Linear(self.shapes['market_context'][-1], 32),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(32, 32),
         )
 
-        # === 3. TREND INDICATORS: Simple MLP (last timestep only) ===
-        # Input: [B, T, 10] - EMA slopes + crossovers + momentum
-        # Binary crossovers (0/1) + continuous slopes
+        # === 3. TREND INDICATORS: 1D CNN for temporal momentum ===
+        # Input: [B, T, 10] - EMA slopes (bounded via tanh) + crossovers
+        # Slopes show momentum evolution over time → benefit from CNN
+        # Changed from MLP to CNN to capture trend acceleration/deceleration patterns
+        # DEEPER architecture for better temporal context (288 timesteps)
+        # With kernel=5 and 4 layers: receptive field = ~17 timesteps
         self.trend_encoder = nn.Sequential(
-            nn.Linear(self.shapes['trend_indicators'][-1], 32),
-            nn.ReLU(),
-            nn.Linear(32, 32),
+            nn.Conv1d(self.shapes['trend_indicators'][-1], 16, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(16, 32, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(32, 32, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(32, 32, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1)  # Global pooling sees all 288 timesteps
         )
 
         # === 4. TRADING SESSIONS: Direct embedding (last timestep) ===
@@ -80,7 +102,7 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
         # Input: [B, T, 5] - Balance, equity, unrealized_pnl, realized_pnl, commission
         self.account_encoder = nn.Sequential(
             nn.Linear(self.shapes['account_state'][-1], 16),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(16, 8),
         )
 
@@ -88,18 +110,31 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
         # Input: [B, T, 7] - Status, leverage, pnl%, distances, risk_reward, duration
         self.position_encoder = nn.Sequential(
             nn.Linear(self.shapes['position_info'][-1], 16),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(16, 8),
         )
 
-        # === FUSION LAYER ===
+        # === FUSION LAYER WITH CROSS-ATTENTION ===
         # Combined: price(64) + market(32) + trend(32) + session(3) + account(8) + position(8) = 147
         # Rebalanced: More weight on price patterns and market context
         combined_dim = 64 + 32 + 32 + 3 + 8 + 8
 
+        # Cross-attention to learn feature relationships
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=combined_dim,
+            num_heads=7,  # 147 dims / 7 heads = 21 dims per head
+            dropout=0.1,
+            batch_first=True
+        )
+
+        self.attention_norm = nn.LayerNorm(combined_dim)
+
+        # Final fusion with residual connection
         self.fusion = nn.Sequential(
             nn.Linear(combined_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim * 2),
         )
 
@@ -127,9 +162,11 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
         market_seq = obs_tensors['market_context']  # [B, T, 6]
         market_pooled = self.market_context_encoder(market_seq[:, -1, :])  # [B, 32]
 
-        # === 3. TREND INDICATORS (MLP, last timestep) ===
+        # === 3. TREND INDICATORS (CNN) ===
+        # [B, T, 10] -> [B, 10, T] for Conv1d -> [B, 32, 1] -> [B, 32]
         trend_seq = obs_tensors['trend_indicators']  # [B, T, 10]
-        trend_pooled = self.trend_encoder(trend_seq[:, -1, :])  # [B, 32]
+        trend_seq = trend_seq.transpose(1, 2)  # [B, 10, T]
+        trend_pooled = self.trend_encoder(trend_seq).squeeze(-1)  # [B, 32]
 
         # === 4. TRADING SESSIONS (Linear, last timestep) ===
         session_seq = obs_tensors['trading_sessions']  # [B, T, 3]
@@ -153,7 +190,20 @@ class TradingEnhancedExtractor(BaseFeaturesExtractor):
             position_pooled,   # 8
         ], dim=1)  # [B, 147]
 
-        # === FUSION ===
+        # === CROSS-ATTENTION: Learn feature relationships ===
+        # Add sequence dimension for attention
+        combined_seq = combined.unsqueeze(1)  # [B, 1, 147]
+
+        # Self-attention across features (learns which features relate to each other)
+        attended, _ = self.cross_attention(
+            combined_seq, combined_seq, combined_seq
+        )  # [B, 1, 147]
+
+        # Apply layer norm and residual connection
+        attended = attended.squeeze(1)  # [B, 147]
+        combined = self.attention_norm(attended + combined)  # Residual connection
+
+        # === FINAL FUSION ===
         fused = self.fusion(combined)  # [B, 256]
 
         return fused

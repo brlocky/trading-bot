@@ -42,24 +42,12 @@ class PivotSLTPCalculator:
             raise ValueError(f"Invalid direction: {direction}. Must be 1 (LONG) or 2 (SHORT)")
 
         # Get current ATR value
-        current_atr = data['atr'].iloc[current_step]
-
+        current_atr = data['atr'].iloc[max(0, current_step-9):current_step+1].fillna(0).mean()
         # Calculate stop loss based on ATR
         if direction == 1:  # LONG
             sl_price = entry_price - (current_atr * atr_multiplier)
         else:  # SHORT
             sl_price = entry_price + (current_atr * atr_multiplier)
-
-        # Ensure minimum risk of 0.5% of entry price (safety check, reduced from 0.5%)
-        min_risk = entry_price * 0.005
-        current_risk = abs(entry_price - sl_price)
-
-        if current_risk < min_risk:
-            # Adjust SL to respect minimum risk
-            if direction == 1:
-                sl_price = entry_price - min_risk
-            else:
-                sl_price = entry_price + min_risk
 
         # Calculate risk distance AFTER adjustment
         risk = abs(entry_price - sl_price)
