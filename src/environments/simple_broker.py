@@ -50,6 +50,8 @@ class SimpleBroker:
         self.position_value = 0.0
         self.avg_entry_price = 0.0
         self.traded = False
+        self.trade_step = 0.0
+        self.reason = ''
 
         # --- Risk Management ---
         self.stop_loss_price = None
@@ -92,6 +94,9 @@ class SimpleBroker:
         self.current_step = step_index
         self.current_price = close
         self.traded = False
+        self.reason = ''
+
+        self.trade_step += 1 if self.position_size != 0 else 0
 
         # Convert signal to target direction
         # 0 = HOLD (keep current position, don't change anything)
@@ -132,8 +137,6 @@ class SimpleBroker:
 
         # If direction changed (reverse position), close and reopen
         if (current_direction != 0 and target_direction in [-1, 1] and target_direction != current_direction):
-            if tp_price is None or sl_price is None:
-                raise ValueError("TP and SL prices must be provided when changing direction")
             self._close_position(close, 'Direction Change')
             self._open_position(target_direction, close, tp_price, sl_price)  # Pass PRICES
             self._update_metrics(close)
@@ -142,14 +145,12 @@ class SimpleBroker:
 
         # Open new position if needed
         if target_direction in [-1, 1] and self.position_size == 0:
-            if tp_price is None or sl_price is None:
-                raise ValueError("TP and SL prices must be provided when openning a position")
             self._open_position(target_direction, close, tp_price, sl_price)  # Pass PRICES
 
         self._update_metrics(close)
         self._record_step(step_index)
 
-    def _open_position(self, direction: int, entry_price: float, tp: float, sl: float) -> bool:
+    def _open_position(self, direction: int, entry_price: float, tp: float | None, sl: float | None) -> bool:
         """Open new position with commission"""
         if self.position_size != 0:
             return False
@@ -182,10 +183,11 @@ class SimpleBroker:
         self.take_profit_price = tp
         self.open_trades += 1
         self.traded = True
+        self.trade_step = 0
 
         # Calculate actual risk-reward ratio from prices
-        risk = abs(entry_price - sl)
-        reward_potential = abs(tp - entry_price)
+        risk = abs(entry_price - sl) if sl is not None else 0
+        reward_potential = abs(tp - entry_price) if tp is not None else 0
         risk_reward_ratio = reward_potential / risk if risk > 0 else 0
 
         # Record trade for performance metrics (will be processed in _update_metrics)
@@ -264,6 +266,7 @@ class SimpleBroker:
         self.stop_loss_price = None
         self.take_profit_price = None
         self.direction = 0
+        self.reason = reason
 
         self.closed_trades += 1
         self.traded = True
@@ -271,39 +274,13 @@ class SimpleBroker:
 
         return true_pnl
 
-    def _calculate_share_size(self, cash: float, entry_price: float, stop_loss: float, risk_percentage: float = 0.01) -> float:
-        """Calculate position size risking 1% of account balance"""
-
-        # print(f"DEBUG: cash={cash}, entry_price={entry_price}, stop_loss={stop_loss}")
-
-        if entry_price <= 0:
-            raise ValueError("Entry price must be positive")
-
-        # Calculate the risk per share (distance to stop-loss)
-        share_risk = abs(entry_price - stop_loss)
-        if share_risk == 0:
+    def _normalize_quantity(self, quantity: float, entry_price: float) -> float:
+        """Normalize quantity to match exchange precision requirements"""
+        if quantity <= 0:
             return 0.0
-
-        # Risk 1% of current balance
-        risk_per_trade = risk_percentage * cash
-
-        # Calculate maximum shares based on risk
-        max_shares_by_risk = risk_per_trade / share_risk
-
-        # print(f"DEBUG: share_risk={share_risk}, risk_per_trade={risk_per_trade}, max_shares_by_risk={max_shares_by_risk}")
-
-        if max_shares_by_risk <= 0:
-            return 0.0
-
-        # Limit to 10x leverage (max position value = 10x available balance)
-        max_position_value = cash * 10.0
-        max_shares_by_leverage = max_position_value / entry_price
-
-        # Take the minimum of risk-based and leverage-based limits
-        max_shares = min(max_shares_by_risk, max_shares_by_leverage)
 
         # Floor to nearest precision
-        floored_size = math.floor(max_shares / self.quantity_precision) * self.quantity_precision
+        floored_size = math.floor(quantity / self.quantity_precision) * self.quantity_precision
 
         # Ensure minimum viable position size
         min_position_value = entry_price * self.quantity_precision
@@ -311,6 +288,43 @@ class SimpleBroker:
             return 0.0
 
         return max(0.0, round(floored_size, 10))
+
+    def _calculate_share_size(self, cash: float, entry_price: float, stop_loss: float | None, risk_percentage: float = 0.01) -> float:
+        """
+        Calculate position size.
+
+        If stop_loss is provided: risk-based sizing (risk_percentage of balance)
+        If stop_loss is None: use full position with max leverage
+        """
+        if entry_price <= 0:
+            raise ValueError("Entry price must be positive")
+
+        # Limit to 10x leverage (max position value = 10x available balance)
+        max_position_value = cash * 10.0
+        max_shares_by_leverage = max_position_value / entry_price
+
+        # If no stop loss, use full position with leverage limit
+        if stop_loss is None:
+            return self._normalize_quantity(max_shares_by_leverage, entry_price)
+
+        # Calculate the risk per share (distance to stop-loss)
+        share_risk = abs(entry_price - stop_loss)
+        if share_risk == 0:
+            return 0.0
+
+        # Risk a percentage of current balance
+        risk_per_trade = risk_percentage * cash
+
+        # Calculate maximum shares based on risk
+        max_shares_by_risk = risk_per_trade / share_risk
+
+        if max_shares_by_risk <= 0:
+            return 0.0
+
+        # Take the minimum of risk-based and leverage-based limits
+        max_shares = min(max_shares_by_risk, max_shares_by_leverage)
+
+        return self._normalize_quantity(max_shares, entry_price)
 
     def _update_metrics(self, price: float):
         """Update all metrics including performance ratios and drawdown"""
@@ -376,8 +390,8 @@ class SimpleBroker:
         """Calculate performance ratios - now uses pre-computed metrics"""
         if self.closed_trades == 0:
             return {
-                'win_rate': 0,
-                'profit_factor': 0,
+                'win_rate': 0.5,
+                'profit_factor': 1,
                 'avg_win': 0,
                 'avg_loss': 0,
                 'expectancy': 0,
@@ -389,7 +403,7 @@ class SimpleBroker:
                 'total_trades': 0,
                 'total_pnl': 0,
                 'total_commission': 0,
-                'final_balance': self.current_balance
+                'final_balance': self.equity
             }
 
         win_rate = self.win_trades / self.closed_trades
@@ -484,6 +498,8 @@ class SimpleBroker:
             'used_balance': self.used_balance,
 
             'traded': self.traded,
+            'trade_step': self.trade_step,
+            'reason': self.reason,
             'open_trades': self.open_trades,
             'closed_trades': self.closed_trades,
             'stop_loss_price': self.stop_loss_price,

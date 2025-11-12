@@ -1,13 +1,12 @@
 """
-Enhanced Session Volume Profile - VP CALCULATIONS ONLY
+Enhanced Session Volume Profile - OPTIMIZED VERSION
 
-Responsibilities:
-- Calculate VAH/VAL/POC for daily/weekly sessions
-- Track session history (last 10 days/weeks)
-- Track naked (untouched) levels
-- Provide current day intraday VP bins
-
-Feature extraction is done in enhanced_features.py (separation of concerns).
+Changes:
+- Use typical price (H+L+C)/3 instead of H/L split
+- Normalize bins once when storing
+- Skip touched levels in naked check
+- Early exit for flat markets
+- Add buffer overflow warning
 """
 
 import torch
@@ -15,7 +14,7 @@ from collections import deque
 
 
 class EnhancedVolumeProfile:
-    """Volume Profile calculator - session-based, clean architecture."""
+    """Volume Profile calculator - session-based, optimized."""
 
     def __init__(self, n_bins=100, lookback_window=288, device="cuda", session_start_hour=0):
         self.device = torch.device(device)
@@ -27,9 +26,10 @@ class EnhancedVolumeProfile:
         self.session_weights = torch.zeros(n_bins, device=device, dtype=torch.float32)
         self.session_bins = torch.zeros(n_bins + 1, device=device, dtype=torch.float32)
 
-        # Current day session data
-        self.current_session_prices = torch.zeros(10000, device=device, dtype=torch.float32)
-        self.current_session_volumes = torch.zeros(10000, device=device, dtype=torch.float32)
+        # Current day session data (OPTIMIZED: single price per bar)
+        self.max_session_bars = 5000  # Max bars per day (was 10000 prices)
+        self.current_session_prices = torch.zeros(self.max_session_bars, device=device, dtype=torch.float32)
+        self.current_session_volumes = torch.zeros(self.max_session_bars, device=device, dtype=torch.float32)
         self.current_session_idx = 0
         self.current_session_date = None
         self.current_session_open = None
@@ -50,11 +50,11 @@ class EnhancedVolumeProfile:
 
         # Current week tracking
         self.current_week = None
-        self.weekly_prices = torch.zeros(50000, device=device, dtype=torch.float32)
-        self.weekly_volumes = torch.zeros(50000, device=device, dtype=torch.float32)
+        self.weekly_prices = torch.zeros(self.max_session_bars * 7, device=device, dtype=torch.float32)
+        self.weekly_volumes = torch.zeros(self.max_session_bars * 7, device=device, dtype=torch.float32)
         self.weekly_idx = 0
 
-        # Current day VP bins history (INTRADAY only - resets daily)
+        # Current day VP bins history (INTRADAY only - NORMALIZED on store)
         self.daily_bins_history = torch.zeros(lookback_window, n_bins, device=device, dtype=torch.float32)
         self.daily_bins_idx = 0
         self.daily_bins_count = 0
@@ -122,6 +122,10 @@ class EnhancedVolumeProfile:
                 self.current_session_volumes[:self.current_session_idx]
             )
 
+            # OPTIMIZED: Skip storing if flat market (all levels None)
+            if vah is None:
+                return
+
             session_info = {
                 'date': self.current_session_date,
                 'open': self.current_session_open,
@@ -146,6 +150,9 @@ class EnhancedVolumeProfile:
                 self.weekly_volumes[:self.weekly_idx]
             )
 
+            if vah is None:
+                return
+
             session_info = {
                 'week': self.current_week,
                 'vah': vah,
@@ -158,25 +165,26 @@ class EnhancedVolumeProfile:
             self.weekly_sessions.append(session_info)
 
     def _update_current_session(self, open_price, high_price, low_price, close_price, volume):
-        """Update current session data."""
-        if self.current_session_idx < len(self.current_session_prices) - 1:
-            self.current_session_prices[self.current_session_idx] = high_price
-            self.current_session_volumes[self.current_session_idx] = volume * 0.5
-            self.current_session_idx += 1
+        """Update current session data - OPTIMIZED: typical price only."""
+        # OPTIMIZED: Use typical price (single entry per bar)
+        typical_price = (high_price + low_price + close_price) / 3
 
-            self.current_session_prices[self.current_session_idx] = low_price
-            self.current_session_volumes[self.current_session_idx] = volume * 0.5
-            self.current_session_idx += 1
+        # Check buffer overflow
+        if self.current_session_idx >= self.max_session_bars:
+            print(f"⚠️ WARNING: Session buffer full ({self.max_session_bars} bars), skipping data")
+            return
 
-        if self.weekly_idx < len(self.weekly_prices) - 1:
-            self.weekly_prices[self.weekly_idx] = high_price
-            self.weekly_volumes[self.weekly_idx] = volume * 0.5
+        self.current_session_prices[self.current_session_idx] = typical_price
+        self.current_session_volumes[self.current_session_idx] = volume
+        self.current_session_idx += 1
+
+        # Weekly data
+        if self.weekly_idx < len(self.weekly_prices):
+            self.weekly_prices[self.weekly_idx] = typical_price
+            self.weekly_volumes[self.weekly_idx] = volume
             self.weekly_idx += 1
 
-            self.weekly_prices[self.weekly_idx] = low_price
-            self.weekly_volumes[self.weekly_idx] = volume * 0.5
-            self.weekly_idx += 1
-
+        # Update high/low
         if high_price > self.current_session_high:
             self.current_session_high = high_price
         if low_price < self.current_session_low:
@@ -191,22 +199,29 @@ class EnhancedVolumeProfile:
         self._check_naked_levels_touched(low_price, high_price)
 
     def _check_naked_levels_touched(self, low_price, high_price):
-        """Mark levels as touched."""
+        """Mark levels as touched - OPTIMIZED: skip already touched."""
+        # OPTIMIZED: Only check untouched levels
         for session in self.daily_sessions:
-            if not session['vah_touched'] and low_price <= session['vah'] <= high_price:
-                session['vah_touched'] = True
-            if not session['val_touched'] and low_price <= session['val'] <= high_price:
-                session['val_touched'] = True
-            if not session['poc_touched'] and low_price <= session['poc'] <= high_price:
-                session['poc_touched'] = True
+            if not session['vah_touched']:
+                if low_price <= session['vah'] <= high_price:
+                    session['vah_touched'] = True
+            if not session['val_touched']:
+                if low_price <= session['val'] <= high_price:
+                    session['val_touched'] = True
+            if not session['poc_touched']:
+                if low_price <= session['poc'] <= high_price:
+                    session['poc_touched'] = True
 
         for session in self.weekly_sessions:
-            if not session['vah_touched'] and low_price <= session['vah'] <= high_price:
-                session['vah_touched'] = True
-            if not session['val_touched'] and low_price <= session['val'] <= high_price:
-                session['val_touched'] = True
-            if not session['poc_touched'] and low_price <= session['poc'] <= high_price:
-                session['poc_touched'] = True
+            if not session['vah_touched']:
+                if low_price <= session['vah'] <= high_price:
+                    session['vah_touched'] = True
+            if not session['val_touched']:
+                if low_price <= session['val'] <= high_price:
+                    session['val_touched'] = True
+            if not session['poc_touched']:
+                if low_price <= session['poc'] <= high_price:
+                    session['poc_touched'] = True
 
     def _calculate_current_day_vp(self):
         """Calculate current day VAH/VAL/POC from session data."""
@@ -220,7 +235,7 @@ class EnhancedVolumeProfile:
             self.current_day_poc = poc
 
     def _update_daily_bins_history(self):
-        """Update current day bins history (for intraday VP distribution)."""
+        """Update current day bins history - OPTIMIZED: normalize once."""
         if self.current_session_idx < 2:
             return
 
@@ -231,9 +246,9 @@ class EnhancedVolumeProfile:
         price_min = prices.min()
         price_max = prices.max()
 
-        if price_max - price_min < 1e-8:
-            price_min = price_min - 0.01
-            price_max = price_max + 0.01
+        # OPTIMIZED: Skip flat markets
+        if price_max - price_min < 1e-6:
+            return
 
         self.bins = torch.linspace(price_min, price_max, self.n_bins + 1,
                                    device=self.device, dtype=torch.float32)
@@ -248,22 +263,29 @@ class EnhancedVolumeProfile:
         if total_vol > 0:
             self.weights /= total_vol
 
-        # Store in history
-        self.daily_bins_history[self.daily_bins_idx] = self.weights.clone()
+        # OPTIMIZED: Normalize before storing (not on every get)
+        weights_normalized = self.weights.clone()
+        weights_min = weights_normalized.min()
+        weights_max = weights_normalized.max()
+        if weights_max > weights_min:
+            weights_normalized = (weights_normalized - weights_min) / (weights_max - weights_min)
+
+        # Store normalized weights in history
+        self.daily_bins_history[self.daily_bins_idx] = weights_normalized
         self.daily_bins_idx = (self.daily_bins_idx + 1) % self.lookback_window
         self.daily_bins_count = min(self.daily_bins_count + 1, self.lookback_window)
 
     def _calculate_value_area_fast(self, prices_t, volumes_t):
-        """Calculate VAH/VAL/POC."""
+        """Calculate VAH/VAL/POC - OPTIMIZED: return None for flat markets."""
         if len(prices_t) == 0:
             return None, None, None
 
         price_min = prices_t.min()
         price_max = prices_t.max()
 
-        if price_max - price_min < 1e-8:
-            poc_val = float(price_min)
-            return poc_val, poc_val, poc_val
+        # OPTIMIZED: Return None instead of flat POC
+        if price_max - price_min < 1e-6:
+            return None, None, None
 
         torch.linspace(price_min, price_max, self.n_bins + 1,
                        out=self.session_bins, dtype=torch.float32)
@@ -297,33 +319,6 @@ class EnhancedVolumeProfile:
 
         return float(vah), float(val), float(poc)
 
-    def get_bins_history(self, lookback):
-        """Get current day VP bins history (INTRADAY only - resets daily)."""
-        if self.daily_bins_count == 0:
-            return torch.zeros(lookback, self.n_bins, device=self.device, dtype=torch.float32)
-
-        if self.daily_bins_count < lookback:
-            result = torch.zeros(lookback, self.n_bins, device=self.device, dtype=torch.float32)
-            result[-self.daily_bins_count:] = self.daily_bins_history[:self.daily_bins_count]
-            bins = result
-        else:
-            idx = self.daily_bins_idx
-            if idx >= lookback:
-                bins = self.daily_bins_history[idx - lookback:idx]
-            else:
-                part1 = self.daily_bins_history[self.lookback_window - (lookback - idx):]
-                part2 = self.daily_bins_history[:idx]
-                bins = torch.cat([part1, part2], dim=0)
-
-        bins_min = bins.min()
-        bins_max = bins.max()
-        if bins_max > bins_min:
-            bins = (bins - bins_min) / (bins_max - bins_min)
-        else:
-            bins = torch.zeros_like(bins)
-
-        return bins
-
     def reset(self):
         """Reset for new episode."""
         self.current_session_idx = 0
@@ -339,14 +334,6 @@ class EnhancedVolumeProfile:
         self.daily_bins_history.zero_()
         self.daily_bins_idx = 0
         self.daily_bins_count = 0
-
-    def get_levels(self):
-        """Get current day VP levels."""
-        return {
-            'vah': self.current_day_vah,
-            'val': self.current_day_val,
-            'poc': self.current_day_poc
-        }
 
     def get_poc(self):
         """Get current POC."""

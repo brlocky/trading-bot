@@ -1,7 +1,7 @@
 """
 SimpleTradingEnv - Multi-Input Trading Environment (Multi-Scale Architecture)
 
-Uses 6 feature groups with temporal/spatial separation for optimal learning:
+Uses 8 feature groups with temporal/spatial separation for optimal learning:
 
 1. Micro Temporal (5): OHLC + Volume [Small-kernel CNN]
    - Fine-grained price movements, temporal patterns
@@ -15,16 +15,27 @@ Uses 6 feature groups with temporal/spatial separation for optimal learning:
    - Current account metrics
 6. Position Info (7): Status, leverage, SL/TP distances [MLP]
    - Current position state
+7. VP Bins (n_bins): Volume distribution histogram [CNN]
+   - Calculated from VISIBLE RANGE (lookback window)
+   - Direct price-to-bin mapping for agent
+8. VP Levels (9): 5 continuous + 4 binary features [Split MLP]
+   - Continuous: high/vah/poc/val/low distances (ordered HIGH→LOW)
+   - Binary: in_va, above_poc, session_intersection, poc_crossover
+   - Calculated from VISIBLE RANGE
 
-Total: 24 features per timestep (price patterns) + 12 features (trading state)
-Architecture: Multi-scale CNN (3 scales) + GNN (optional) + 2 MLPs -> fused features
+Total: 24 features (price patterns) + 12 (trading state) + n_bins + 9 (volume profile)
+Architecture: Multi-scale CNN (4 scales) + 3 MLPs -> fused features
 
 Action Space: MultiDiscrete([4]) - [Direction: HOLD/LONG/SHORT/CLOSE]
+
+Volume Profile Notes:
+- Uses Visible Range VP (not session-based)
+- VP bins/levels calculated on-the-fly from lookback window data
+- No session detection or circular buffers
+- Agent can directly map VP bins to visible prices
 """
 
-from copy import deepcopy
 import gymnasium as gym
-import torch
 import numpy as np
 import pandas as pd
 from gymnasium.spaces import MultiDiscrete
@@ -32,6 +43,8 @@ from environments import SimpleBroker
 from data_processing.enhanced_features import (
     get_account_state_features,
     get_position_info_features,
+    get_vp_bins_features_visible,
+    get_vp_levels_features_visible,
     precompute_micro_temporal_features,
     precompute_micro_spatial_features,
     precompute_meso_patterns_features,
@@ -39,6 +52,7 @@ from data_processing.enhanced_features import (
 )
 from utils.PivotsSLTPCalculator import PivotSLTPCalculator
 from utils.indicator_utils import add_indicators
+from environments.trade_logger import TradeLogger
 
 
 class SimpleTradingEnv(gym.Env):
@@ -53,38 +67,37 @@ class SimpleTradingEnv(gym.Env):
 
     def __init__(
         self, data, initial_balance=10000, lookback_window=288,
-        n_bins=50, device="cuda", render_mode='human',
-        enable_pattern_memory=False
+        n_bins=50, render_mode='human',
+        vp_cache=None,
+        enable_trade_logging=False,
+        trade_log_dir="logs/trades"
     ):
         super().__init__()
 
         self.lookback_window = lookback_window
-        self.device = device
         self.initial_balance = initial_balance
         self.n_bins = n_bins
         self.render_mode = render_mode
 
+        # Shared VP cache across all environments (passed from notebook)
+        # Format: {step: {'bins': np.ndarray, 'levels': np.ndarray}}
+        self.vp_cache = vp_cache if vp_cache is not None else {}
+
+        # Trade logging for post-training analysis
+        self.enable_trade_logging = enable_trade_logging
+        self.trade_logger = TradeLogger(log_dir=trade_log_dir) if enable_trade_logging else None
+
+        # Prepare data
         self.data = data.copy()
-        # Add technical indicators if not already present
         self.data['date'] = pd.to_datetime(self.data['date_close'])
         add_indicators(self.data)
-        intial_data_len = len(self.data)
+        initial_data_len = len(self.data)
         self.data = self.data.dropna().reset_index(drop=True)
         data_len_after_na = len(self.data)
-        if data_len_after_na < intial_data_len:
-            print(f"Info: Dropped {intial_data_len - data_len_after_na} rows due to NaNs after adding indicators.")
+        if data_len_after_na < initial_data_len:
+            print(f"Info: Dropped {initial_data_len - data_len_after_na} rows due to NaNs after adding indicators.")
 
         self.data_len = len(self.data)
-
-        # Initialize pattern memory
-        self.enable_pattern_memory = enable_pattern_memory
-        if enable_pattern_memory:
-            from environments.trading_pattern_memory import TradingPatternMemory
-            self.pattern_memory = TradingPatternMemory()
-
-        # Track current episode
-        self.episode_transitions = []
-        self.episode_return = 0.0
 
         # Prepare data with all features - pre-compute all static features (modifies in place)
         self.micro_temporal_cols = precompute_micro_temporal_features(self.data, window=lookback_window)
@@ -93,21 +106,10 @@ class SimpleTradingEnv(gym.Env):
         self.macro_cols = precompute_macro_patterns_features(self.data, window=lookback_window)
 
         # Pre-convert price features to tensors (avoid DataFrame→NumPy→Tensor conversion on every step)
-        self.micro_temporal_tensor = torch.from_numpy(
-            self.data[self.micro_temporal_cols].values.astype(np.float32)
-        ).to(device)
-
-        self.micro_spatial_tensor = torch.from_numpy(
-            self.data[self.micro_spatial_cols].values.astype(np.float32)
-        ).to(device)
-
-        self.meso_tensor = torch.from_numpy(
-            self.data[self.meso_cols].values.astype(np.float32)
-        ).to(device)
-
-        self.macro_tensor = torch.from_numpy(
-            self.data[self.macro_cols].values.astype(np.float32)
-        ).to(device)
+        self.micro_temporal_data = self.data[self.micro_temporal_cols].values.astype(np.float32)
+        self.micro_spatial_data = self.data[self.micro_spatial_cols].values.astype(np.float32)
+        self.meso_data = self.data[self.meso_cols].values.astype(np.float32)
+        self.macro_data = self.data[self.macro_cols].values.astype(np.float32)
 
         # Action space: [direction, risk_reward_ratio, atr_multiplier]
         # - direction: 0=HOLD, 1=LONG, 2=SHORT, 3=CLOSE
@@ -137,6 +139,16 @@ class SimpleTradingEnv(gym.Env):
                 shape=(lookback_window, len(self.macro_cols)),
                 dtype=np.float32
             ),
+            'vp_bins': gym.spaces.Box(
+                low=0.0, high=1.0,
+                shape=(lookback_window, n_bins),
+                dtype=np.float32
+            ),
+            'vp_levels': gym.spaces.Box(
+                low=-1.0, high=1.0,
+                shape=(lookback_window, 26),  # 20 continuous (OHLC×5) + 6 binary
+                dtype=np.float32
+            ),
             'account_state': gym.spaces.Box(
                 low=-np.inf, high=np.inf,
                 shape=(lookback_window, 5),
@@ -150,7 +162,7 @@ class SimpleTradingEnv(gym.Env):
         })
 
         # Initialize broker, volume profile, and zigzag state
-        self.broker = SimpleBroker(initial_balance=self.initial_balance, quantity_precision=0.001)
+        self.broker = SimpleBroker(initial_balance=self.initial_balance, quantity_precision=0.001, maker_commission=0, taker_commission=0)
         # self.vp = EnhancedVolumeProfile(n_bins=n_bins, lookback_window=lookback_window, device=device)
 
         self.reset()
@@ -158,24 +170,16 @@ class SimpleTradingEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
 
-        # Save previous episode if it exists
-        if self.enable_pattern_memory and len(self.episode_transitions) > 0:
-            episode_data = self._create_episode_summary()
-            self.pattern_memory.add_episode(episode_data)
-
-        # Reset episode tracking
-        self.episode_transitions = []
-        self.episode_return = 0.0
-
         self.current_step = self.lookback_window
         self.history = []
         self.broker.reset()
-        # self.vp.reset()
 
-        # Warm up the broker and volume profile
+        # Warm up the broker with historical data
         for i in range(self.lookback_window):
+            row = self.data.iloc[i]
+
             # Initialize broker state
-            self.broker.step(i, 0, self.data['close'].iloc[i], self.data['high'].iloc[i], self.data['low'].iloc[i], 0, 0)
+            self.broker.step(i, 0, row['close'], row['high'], row['low'], 0, 0)
 
             # Record initial state
             self.history.append({
@@ -205,7 +209,6 @@ class SimpleTradingEnv(gym.Env):
         current_price_low = self.data['low'].iloc[self.current_step].item()
 
         previous_state = self.broker.get_state()
-        previous_trades = deepcopy(self.broker.trade_history)
 
         # Calculate SL/TP only for LONG and SHORT actions
         sl_price, tp_price = PivotSLTPCalculator.calculate_sl_tp(
@@ -230,19 +233,8 @@ class SimpleTradingEnv(gym.Env):
         )
 
         current_state = self.broker.get_state()
-        current_trades = self.broker.trade_history
 
-        reward = self.calculate_reward(direction_action, current_trades, previous_trades, current_state, previous_state)
-
-        # Track transition for pattern memory
-        if self.enable_pattern_memory:
-            self.episode_transitions.append({
-                'step': self.current_step,
-                'action': action,
-                'reward': reward,           # Normalized reward
-                'info': current_state.copy()
-            })
-            self.episode_return += reward
+        reward = self.calculate_reward(direction_action, current_state, previous_state)
 
         done = False
         truncated = False
@@ -263,13 +255,6 @@ class SimpleTradingEnv(gym.Env):
         self.current_step += 1
         truncated = self.current_step >= len(self.data) - 1 if truncated is False else truncated
 
-        # If episode ends, save it
-        if (done or truncated) and self.enable_pattern_memory and len(self.episode_transitions) > 0:
-            episode_data = self._create_episode_summary()
-            self.pattern_memory.add_episode(episode_data)
-            self.episode_transitions = []
-            self.episode_return = 0.0
-
         obs = self._get_obs()
         return obs, reward, done, truncated, self.history[-1]
 
@@ -284,29 +269,61 @@ class SimpleTradingEnv(gym.Env):
         4. Macro Patterns (1): Daily trends → Large kernel CNN
         5. Account State (5): Current account metrics → MLP
         6. Position Info (7): Current position state → MLP
+        7. VP Bins (n_bins): Volume distribution histogram → CNN
+        8. VP Levels (9): 5 continuous + 4 binary features → Split MLP
+           - Continuous: high/vah/poc/val/low distances
+           - Binary: in_va, above_poc, session_intersection, poc_crossover
         """
         start_idx = max(0, self.current_step - self.lookback_window)
         end_idx = self.current_step
 
         # Group 1-4: Multi-scale price patterns (tensor slicing + zero-copy conversion)
         # Use contiguous() to ensure efficient memory layout after slicing
-        micro_temporal = self.micro_temporal_tensor[start_idx:end_idx].contiguous()
-        micro_spatial = self.micro_spatial_tensor[start_idx:end_idx].contiguous()
-        meso_patterns = self.meso_tensor[start_idx:end_idx].contiguous()
-        macro_patterns = self.macro_tensor[start_idx:end_idx].contiguous()
+        micro_temporal = self.micro_temporal_data[start_idx:end_idx]
+        micro_spatial = self.micro_spatial_data[start_idx:end_idx]
+        meso_patterns = self.meso_data[start_idx:end_idx]
+        macro_patterns = self.macro_data[start_idx:end_idx]
 
         # Group 5: Account State
         account_state = get_account_state_features(
             self.broker.step_history,
             self.initial_balance,
             self.lookback_window
-        ).to(self.device)
+        )
 
         # Group 6: Position Info
         position_info = get_position_info_features(
             self.broker.step_history,
             self.lookback_window,
-        ).to(self.device)
+        )
+
+        # Group 7 & 8: VP Bins and Levels (with shared cache across all envs)
+        # Check if already calculated for this step
+        if self.current_step not in self.vp_cache:
+            # Calculate once and cache for all environments
+            vp_bins = get_vp_bins_features_visible(
+                self.data,
+                self.current_step,
+                self.lookback_window,
+                self.n_bins
+            )
+
+            vp_levels = get_vp_levels_features_visible(
+                self.data,
+                self.current_step,
+                self.lookback_window,
+                self.n_bins
+            )
+
+            # Store in shared cache
+            self.vp_cache[self.current_step] = {
+                'bins': vp_bins,
+                'levels': vp_levels
+            }
+        else:
+            # Reuse from cache (other env already calculated this step)
+            vp_bins = self.vp_cache[self.current_step]['bins']
+            vp_levels = self.vp_cache[self.current_step]['levels']
 
         # Build observation dictionary (will be converted to numpy arrays below)
         obs_dict: dict = {  # type: ignore - will contain numpy arrays after conversion
@@ -316,123 +333,114 @@ class SimpleTradingEnv(gym.Env):
             'macro_patterns': macro_patterns,
             'account_state': account_state,
             'position_info': position_info,
+            'vp_bins': vp_bins,
+            'vp_levels': vp_levels,
         }
 
-        # Sanitize all tensors and convert to NumPy for Stable-Baselines3
-        for key, tensor in obs_dict.items():
-            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-                print(f"Warning: NaN/Inf in {key} at step {self.current_step}")
-                tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1e6, neginf=-1e6)
-                raise ValueError(f"NaN/Inf detected in observation tensor '{key}'.")
+        for key, array in obs_dict.items():
+            if np.isnan(array).any() or np.isinf(array).any():
+                raise ValueError(f"NaN/Inf detected in observation array '{key}'.")
 
-            # Check for values outside [-1, 1] range
-            tensor_min = tensor.min().item()
-            tensor_max = tensor.max().item()
-            if tensor_min < -1.0 or tensor_max > 1.0:
-                # Find indices of invalid values
-                min_idx = (tensor == tensor_min).nonzero(as_tuple=False)[0].tolist()
-                max_idx = (tensor == tensor_max).nonzero(as_tuple=False)[0].tolist()
-                print(f"Warning: Values outside [-1, 1] in '{key}' at step {self.current_step}:")
-                print(f"  min={tensor_min:.4f} at indices {min_idx[:5]}{'...' if len(min_idx) > 5 else ''}")
-                print(f"  max={tensor_max:.4f} at indices {max_idx[:5]}{'...' if len(max_idx) > 5 else ''}")
-
-            # Convert to NumPy array for Stable-Baselines3 (minimize copies)
-            if tensor.is_cuda:
-                obs_dict[key] = tensor.cpu().numpy().astype(np.float32)
+            # Check ranges (VP bins in [0,1], others in [-1,1])
+            if key == 'vp_bins':
+                expected_min, expected_max = 0.0, 1.0
             else:
-                obs_dict[key] = tensor.numpy().astype(np.float32)
+                expected_min, expected_max = -1.0, 1.0
+
+            array_min = array.min()
+            array_max = array.max()
+            if array_min < expected_min - 0.01 or array_max > expected_max + 0.01:
+                # Find indices of invalid values using NumPy
+                min_idx = np.where(array == array_min)[0].tolist()
+                max_idx = np.where(array == array_max)[0].tolist()
+                print(f"Warning: Values outside [{expected_min}, {expected_max}] in '{key}' at step {self.current_step}:")
+                print(f"  min={array_min:.4f} at indices {min_idx[:5]}{'...' if len(min_idx) > 5 else ''}")
+                print(f"  max={array_max:.4f} at indices {max_idx[:5]}{'...' if len(max_idx) > 5 else ''}")
 
         return obs_dict
 
-    def calculate_reward(self, action, current_trades, previous_trades, current_state, previous_state):
+    def calculate_reward(self, action, current_state, previous_state):
         """
-        REWARD FUNCTION v30 - AGGRESSIVE EXPLORATION + SHAPED REWARDS
+        REWARD FUNCTION v37 - SIMPLIFIED FOR STABLE LEARNING
 
-        Changes from v29:
-        - Increased exploration bonus: 0.1 → 0.3
-        - Added position holding reward: +0.01/step when in position
-        - Increased balance change scaling: 30x → 100x
-        - Reduced invalid action penalties
+        Focus on what matters:
+        1. Make profitable trades (80%)
+        2. Don't go bankrupt (10%)
+        3. Don't do invalid actions (10%)
+
+        Removed:
+        - Constant HOLD penalty (kills exploration)
+        - Performance metrics (too sparse early in training)
+        - Trade close bonus (redundant with PnL)
+
+        Expected range per step: [-1.0, +1.0]
+        Expected range per episode: More balanced around 0 for random policy
         """
         if previous_state is None:
             return 0.0
 
-        reward = 0.0
         current_balance = current_state.get('equity', 0)
         previous_balance = previous_state.get('equity', 0)
         current_position = current_state.get('position_size', 0)
         previous_position = previous_state.get('position_size', 0)
+        current_step_on_trade = current_state.get('trade_step', 0)
 
-        # === 1. BALANCE CHANGE (AMPLIFIED!) ===
+        # ========================================
+        # COMPONENT 1: PnL Change (80% weight)
+        # ========================================
+        # Reward every profitable action, penalize every loss
         balance_change = current_balance - previous_balance
         balance_change_pct = balance_change / self.initial_balance
 
-        # INCREASED: Scale balance change more aggressively
-        # Typical 1% change → ±1.0 reward (was ±0.3)
-        balance_reward = balance_change_pct * 100.0
-        balance_reward = float(np.clip(balance_reward, -1.0, 1.0))
-        reward += balance_reward
+        # Improved scaling: $100 profit on $10k = 1% = tanh(1.0) = 0.76 reward (stronger signal)
+        pnl_component = float(np.tanh(balance_change_pct * 100))
 
-        # === 2. POSITION HOLDING REWARD ===
-        # Reward for being in a position (encourages action)
-        if current_position != 0 and previous_position != 0:
-            reward += 0.1  # Small reward per step in position
+        # Close trade reward based on realized PnL ratio
+        if current_state.get('traded') and previous_position != 0:
+            ratio = current_state.get('realized_pnl') / previous_state.get('used_balance')
+            pnl_component = np.tan(ratio)
 
-        # === 3. TRADE COMPLETION REWARDS ===
-        current_closed = [t for t in current_trades if t.get('status') == 'CLOSED']
-        previous_closed = [t for t in previous_trades if t.get('status') == 'CLOSED']
+        # Reward for holding winnig trades
+        if 10 > current_step_on_trade < 30:
+            pnl_component += np.tan(pnl_component * 1.2) * 0.1
 
-        if len(current_closed) > len(previous_closed):
-            new_trade = current_closed[-1]
-            reason = new_trade.get('reason', 'Unknown')
+        # ========================================
+        # COMPONENT 2: Bankruptcy Penalty (10% weight)
+        # ========================================
+        equity_ratio = current_balance / self.initial_balance
+        if equity_ratio < 0.8:
+            bankruptcy_component = -float(np.tanh((0.8 - equity_ratio) * 5))
+        else:
+            bankruptcy_component = 0.0
 
-            if 'TP' in reason:
-                reward += 1.0  # Maximum reward
+        # ========================================
+        # COMPONENT 3: Action Validity (10% weight)
+        # ========================================
+        validity_component = 0.0
 
-            elif 'SL' in reason:
-                reward += -0.5  # 2:1 ratio
+        # Valid Open
+        if action in [1, 2] and previous_position == 0:
+            validity_component = 1.0
 
-            else:  # Manual close
-                reward += -0.05
+        # Valid Close
+        if action == 3 and previous_position != 0:
+            validity_component = 1.0
 
-        # === 4. EXPLORATION INCENTIVES (INCREASED!) ===
-        # Opening new position bonus - TRIPLED!
-        if previous_position == 0 and current_position != 0:
-            reward += 0.3  # Was 0.1
-
-        # === 5. REDUCED INVALID ACTION PENALTIES ===
-        # Very small penalties - don't discourage exploration
+        # Trying to close with no position
         if action == 3 and previous_position == 0:
-            reward -= 0.1  # Was 0.05
+            validity_component = -1.0
 
+        # Trying to open new position while already in one
         if action in [1, 2] and previous_position != 0:
-            reward -= 0.1  # Was 0.1
+            validity_component = -1.0
 
-        # === 6. BANKRUPTCY PENALTY ===
-        if self.broker.is_bankrupt:
-            reward = -1.0
+        # ========================================
+        # WEIGHTED COMBINATION
+        # ========================================
+        reward = (
+            0.80 * pnl_component +
+            0.10 * bankruptcy_component +
+            0.10 * validity_component
+        )
 
         return reward
-
-    def _create_episode_summary(self):
-        """Create summary of episode for pattern memory"""
-        trades = [t for t in self.broker.step_history if t.get('status') == 'CLOSED']
-        winning_trades = [t for t in trades if t.get('pnl_percent', 0) > 0]
-
-        # Calculate market conditions from recent data
-        recent_window = 20
-        end_idx = min(self.current_step, len(self.data) - 1)
-        start_idx = max(0, end_idx - recent_window)
-
-        return {
-            'transitions': self.episode_transitions.copy(),
-            'total_return': self.episode_return,
-            'total_trades': len(trades),
-            'win_rate': len(winning_trades) / len(trades) if trades else 0.0,
-            'final_balance': self.broker.get_state()['current_balance'],
-            'episode_length': len(self.episode_transitions),
-            'market_conditions': {
-                'volatility': float(self.data['close'].iloc[start_idx:end_idx].std()),
-                'avg_volume': float(self.data['volume'].iloc[start_idx:end_idx].mean()),
-            }
-        }

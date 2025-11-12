@@ -1,3 +1,4 @@
+import math
 from environments.simple_broker import SimpleBroker
 
 
@@ -232,3 +233,140 @@ class TestRiskManagement:
 
         # Should return 0 when stop distance is 0
         assert share_size == 0.0, "Should return 0 for zero stop distance"
+
+    def test_calculate_share_size_no_stop_loss(self):
+        """Test _calculate_share_size uses full leverage when stop_loss is None"""
+        cash = 10000.0
+        entry_price = 50000.0
+        stop_loss = None  # No stop loss
+
+        share_size = self.broker._calculate_share_size(cash, entry_price, stop_loss)
+
+        # Should use max 10x leverage
+        max_position_value = cash * 10.0
+        expected_shares = max_position_value / entry_price
+        # Account for precision normalization
+        expected_normalized = math.floor(expected_shares / self.broker.quantity_precision) * self.broker.quantity_precision
+
+        assert abs(share_size - expected_normalized) < 0.0001, f"Expected {expected_normalized}, got {share_size}"
+
+        # Verify it's much larger than typical risk-based position
+        risk_based_size = self.broker._calculate_share_size(cash, entry_price, 49000.0, risk_percentage=0.01)
+        assert share_size > risk_based_size, "Full leverage should be larger than risk-based sizing"
+
+    def test_open_position_without_stop_loss(self):
+        """Test opening a position without stop loss (SL=None)"""
+        entry_price = 100.0
+        initial_balance = self.broker.current_balance
+
+        # Open LONG without SL, only TP
+        self.broker.step(0, 1, entry_price, entry_price+1, entry_price-1, tp_price=105.0, sl_price=None)
+
+        assert self.broker.position_size > 0, "Position should be opened"
+        assert self.broker.stop_loss_price is None, "Stop loss should be None"
+        assert self.broker.take_profit_price == 105.0, "Take profit should be set"
+
+        # Calculate expected position size (10x leverage)
+        max_position_value = initial_balance * 10.0
+        expected_shares = max_position_value / entry_price
+        expected_normalized = math.floor(expected_shares / self.broker.quantity_precision) * self.broker.quantity_precision
+
+        # Allow small difference due to commission
+        assert abs(self.broker.position_size - expected_normalized) < 0.01, \
+            f"Position size {self.broker.position_size} should be close to full leverage {expected_normalized}"
+
+    def test_open_position_without_take_profit(self):
+        """Test opening a position without take profit (TP=None)"""
+        entry_price = 100.0
+
+        # Open SHORT without TP, only SL
+        self.broker.step(0, 2, entry_price, entry_price+1, entry_price-1, tp_price=None, sl_price=105.0)
+
+        assert self.broker.position_size < 0, "Short position should be opened"
+        assert self.broker.take_profit_price is None, "Take profit should be None"
+        assert self.broker.stop_loss_price == 105.0, "Stop loss should be set"
+
+    def test_open_position_without_tp_and_sl(self):
+        """Test opening a position without both TP and SL"""
+        entry_price = 100.0
+        initial_balance = self.broker.current_balance
+
+        # Open LONG without TP or SL
+        self.broker.step(0, 1, entry_price, entry_price+1, entry_price-1, tp_price=None, sl_price=None)
+
+        assert self.broker.position_size > 0, "Position should be opened"
+        assert self.broker.stop_loss_price is None, "Stop loss should be None"
+        assert self.broker.take_profit_price is None, "Take profit should be None"
+
+        # Should use full leverage
+        max_position_value = initial_balance * 10.0
+        expected_shares = max_position_value / entry_price
+        expected_normalized = math.floor(expected_shares / self.broker.quantity_precision) * self.broker.quantity_precision
+
+        assert abs(self.broker.position_size - expected_normalized) < 0.01, \
+            "Position size should use full leverage"
+
+    def test_no_stop_loss_trigger_when_none(self):
+        """Test that SL doesn't trigger when it's None"""
+        entry_price = 100.0
+
+        # Open LONG without SL
+        self.broker.step(0, 1, entry_price, entry_price+1, entry_price-1, tp_price=110.0, sl_price=None)
+        position_size = self.broker.position_size
+
+        # Price drops significantly (would normally hit SL)
+        self.broker.step(1, 1, 90.0, 92.0, 88.0, tp_price=110.0, sl_price=None)
+
+        assert self.broker.position_size == position_size, "Position should remain open (no SL to hit)"
+        assert self.broker.close_reason != 'SL', "Should not close via stop loss"
+
+    def test_no_take_profit_trigger_when_none(self):
+        """Test that TP doesn't trigger when it's None"""
+        entry_price = 100.0
+
+        # Open LONG without TP
+        self.broker.step(0, 1, entry_price, entry_price+1, entry_price-1, tp_price=None, sl_price=95.0)
+        position_size = self.broker.position_size
+
+        # Price rises significantly (would normally hit TP)
+        self.broker.step(1, 1, 110.0, 112.0, 108.0, tp_price=None, sl_price=95.0)
+
+        assert self.broker.position_size == position_size, "Position should remain open (no TP to hit)"
+        assert self.broker.close_reason != 'TP', "Should not close via take profit"
+
+    def test_manual_close_without_tp_sl(self):
+        """Test manually closing a position that has no TP/SL"""
+        entry_price = 100.0
+
+        # Open LONG without TP or SL
+        self.broker.step(0, 1, entry_price, entry_price+1, entry_price-1, tp_price=None, sl_price=None)
+        assert self.broker.position_size > 0
+
+        # Hold for a few steps
+        self.broker.step(1, 1, 105.0, 106.0, 104.0, tp_price=None, sl_price=None)
+        assert self.broker.position_size > 0
+
+        # Manually close via signal=3
+        self.broker.step(2, 3, 105.0, 106.0, 104.0, tp_price=None, sl_price=None)
+
+        assert self.broker.position_size == 0, "Position should be closed"
+        assert self.broker.close_reason == 'Manual Close', "Should close manually"
+        assert self.broker.realized_pnl > 0, "Should have profit from price increase"
+
+    def test_full_leverage_position_value(self):
+        """Test that position opened with no SL uses correct balance"""
+        initial_balance = 1000.0
+        broker = SimpleBroker(initial_balance=initial_balance, maker_commission=0.001)
+        entry_price = 50000.0
+
+        # Open position without SL (should use full leverage)
+        broker.step(0, 1, entry_price, entry_price+100, entry_price-100, tp_price=55000.0, sl_price=None)
+
+        # Calculate expected values
+        actual_position_value = abs(broker.position_size) * entry_price
+
+        # Should be close to 10x initial balance (minus small commission)
+        assert actual_position_value >= initial_balance * 9.0, \
+            f"Position value {actual_position_value} should be close to 10x balance {initial_balance * 10}"
+        assert actual_position_value <= initial_balance * 10.0, \
+            f"Position value {actual_position_value} should not exceed 10x leverage"
