@@ -2,6 +2,8 @@ import math
 import numpy as np
 from typing import Dict
 
+import pandas as pd
+
 
 class SimpleBroker:
     """
@@ -50,8 +52,7 @@ class SimpleBroker:
         self.position_value = 0.0
         self.avg_entry_price = 0.0
         self.traded = False
-        self.trade_step = 0.0
-        self.reason = ''
+        self.in_trade_step = 0.0
 
         # --- Risk Management ---
         self.stop_loss_price = None
@@ -64,7 +65,7 @@ class SimpleBroker:
         self.closed_trades = 0
         self.win_trades = 0
         self.lost_trades = 0
-        self.close_reason = None
+        self.close_reason = ''
         self.is_bankrupt = False
         self.performance = {}
 
@@ -87,67 +88,44 @@ class SimpleBroker:
     def step(self,
              step_index: int,
              signal: int,  # 0=HOLD, 1=LONG, 2=SHORT, 3=CLOSE
-             close: float, high: float, low: float,
+             new_state: pd.Series,
              tp_price: float | None,
              sl_price: float | None):
 
-        self.current_step = step_index
-        self.current_price = close
-        self.traded = False
-        self.reason = ''
+        # Update current price
+        self.current_price = new_state['open']
 
-        self.trade_step += 1 if self.position_size != 0 else 0
+        # Update step index
+        self.current_step = step_index
+
+        # Reset traded flag and close reason
+        self.traded = False
+        self.close_reason = ''
+
+        # Increment in-trade step counter
+        self.in_trade_step += 1 if self.position_size != 0 else 0
 
         # Convert signal to target direction
         # 0 = HOLD (keep current position, don't change anything)
         # 1 = LONG
         # 2 = SHORT
-        # 3 = CLOSE (explicitly close position)
         if signal == 0:      # HOLD
             target_direction = None  # None means maintain current state
         elif signal == 1:    # LONG
             target_direction = 1
         elif signal == 2:    # SHORT
             target_direction = -1
-        elif signal == 3:    # CLOSE
-            target_direction = 0  # 0 means go flat (close position)
         else:
             raise ValueError(f"Invalid signal: {signal}. Expected 0, 1, 2, or 3")
 
-        current_direction = np.sign(self.position_size)
+        # Open new position if needed
+        if target_direction in [-1, 1]:
+            self._open_position(target_direction, self.current_price, tp_price, sl_price)  # Pass PRICES
 
         # Check stop loss/take profit first
-        if self._check_stop_loss_take_profit(high, low):
-            self._update_metrics(close)
-            self._record_step(step_index)
-            return
+        self._check_stop_loss_take_profit(new_state['high'], new_state['low'])
 
-        # If signal is HOLD (target_direction=None), maintain current position
-        if target_direction is None:
-            self._update_metrics(close)
-            self._record_step(step_index)
-            return
-
-        # If signal is CLOSE (target_direction=0) and we have a position, close it
-        if target_direction == 0:
-            self._close_position(close, 'Manual Close')
-            self._update_metrics(close)
-            self._record_step(step_index)
-            return
-
-        # If direction changed (reverse position), close and reopen
-        if (current_direction != 0 and target_direction in [-1, 1] and target_direction != current_direction):
-            self._close_position(close, 'Direction Change')
-            self._open_position(target_direction, close, tp_price, sl_price)  # Pass PRICES
-            self._update_metrics(close)
-            self._record_step(step_index)
-            return
-
-        # Open new position if needed
-        if target_direction in [-1, 1] and self.position_size == 0:
-            self._open_position(target_direction, close, tp_price, sl_price)  # Pass PRICES
-
-        self._update_metrics(close)
+        self._update_metrics(new_state['close'])
         self._record_step(step_index)
 
     def _open_position(self, direction: int, entry_price: float, tp: float | None, sl: float | None) -> bool:
@@ -183,7 +161,7 @@ class SimpleBroker:
         self.take_profit_price = tp
         self.open_trades += 1
         self.traded = True
-        self.trade_step = 0
+        self.in_trade_step = 0
 
         # Calculate actual risk-reward ratio from prices
         risk = abs(entry_price - sl) if sl is not None else 0
@@ -266,7 +244,6 @@ class SimpleBroker:
         self.stop_loss_price = None
         self.take_profit_price = None
         self.direction = 0
-        self.reason = reason
 
         self.closed_trades += 1
         self.traded = True
@@ -487,19 +464,16 @@ class SimpleBroker:
             'initial_balance': self.initial_balance,
             'current_balance': self.current_balance,
             'equity': self.equity,
-
             'position_size': self.position_size,
             'position_value': self.position_value,
             'entry_price': self.avg_entry_price,
-
             'unrealized_pnl': self.unrealized_pnl,
             'realized_pnl': self.realized_pnl,
             'total_commission': self.total_commission,
             'used_balance': self.used_balance,
-
             'traded': self.traded,
-            'trade_step': self.trade_step,
-            'reason': self.reason,
+            'in_trade_step': self.in_trade_step,
+            'reason': self.close_reason,
             'open_trades': self.open_trades,
             'closed_trades': self.closed_trades,
             'stop_loss_price': self.stop_loss_price,
@@ -510,5 +484,5 @@ class SimpleBroker:
     def get_state(self) -> Dict:
         """Get current broker state"""
         if not self.step_history:
-            return {}
+            raise ValueError("No step history available. Please perform at least one step.")
         return self.step_history[-1]

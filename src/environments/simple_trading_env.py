@@ -67,7 +67,9 @@ class SimpleTradingEnv(gym.Env):
 
     def __init__(
         self, data, initial_balance=10000, lookback_window=288,
-        n_bins=50, render_mode='human',
+        n_bins=255, render_mode='human',
+        maker_commission=0.00055,
+        taker_commission=0.0002,
         vp_cache=None,
         enable_trade_logging=False,
         trade_log_dir="logs/trades"
@@ -116,7 +118,7 @@ class SimpleTradingEnv(gym.Env):
         # - risk_reward_ratio: 0-9 (maps to 1.0x-10.0x)
         # - atr_multiplier: 0-9 (maps to 1.0-2.8)
         # self.action_space = MultiDiscrete([4, 10, 10])
-        self.action_space = MultiDiscrete([4])
+        self.action_space = MultiDiscrete([3])  # [HOLD, LONG, SHORT] - CLOSE handled internally
 
         self.observation_space = gym.spaces.Dict({
             'micro_temporal': gym.spaces.Box(
@@ -162,7 +164,12 @@ class SimpleTradingEnv(gym.Env):
         })
 
         # Initialize broker, volume profile, and zigzag state
-        self.broker = SimpleBroker(initial_balance=self.initial_balance, quantity_precision=0.001, maker_commission=0, taker_commission=0)
+        self.broker = SimpleBroker(
+            initial_balance=self.initial_balance,
+            quantity_precision=0.001,
+            maker_commission=maker_commission,
+            taker_commission=taker_commission
+        )
         # self.vp = EnhancedVolumeProfile(n_bins=n_bins, lookback_window=lookback_window, device=device)
 
         self.reset()
@@ -174,12 +181,14 @@ class SimpleTradingEnv(gym.Env):
         self.history = []
         self.broker.reset()
 
+        self.last_open_traded_step = -1
+
         # Warm up the broker with historical data
         for i in range(self.lookback_window):
-            row = self.data.iloc[i]
+            new_state = self.data.iloc[i]
 
             # Initialize broker state
-            self.broker.step(i, 0, row['close'], row['high'], row['low'], 0, 0)
+            self.broker.step(i, 0, new_state, tp_price=None, sl_price=None)
 
             # Record initial state
             self.history.append({
@@ -193,55 +202,73 @@ class SimpleTradingEnv(gym.Env):
 
         return self._get_obs(), {}
 
-    def step(self, action):
+    def get_action_mask(self):
+        """Returns which actions are valid in current state"""
+        if self.broker.position_size == 0:
+            # Flat position - can open long, short, or hold
+            return [True, True, True]  # [hold, long, short]
+        else:
+            # In position - can only close or hold
+            return [True, False, False]  # [hold, long, short]
 
+    def step(self, action):
         # Unpack action: [direction, risk_reward_idx, atr_idx]
         # direction_action, rr_idx, atr_idx = int(action[0]), int(action[1]), int(action[2])
         # risk_reward_ratio = 1.0 + (rr_idx * 1.0)  # Maps 0-9 to 1.0-10.0
         # tr_multiplier = 2.0 + (atr_idx * 0.3)    # Maps 0-9 to 2.0-4.7 (wider SL)
-        direction_action = int(action[0])
-        risk_reward_ratio = 2.5
-        atr_multiplier = 2.0
+        action = int(action[0])
+        risk_reward_ratio = 3
+        atr_multiplier = 1.5
 
-        # Convert to actual prices
-        current_price = self.data['close'].iloc[self.current_step].item()
-        current_price_high = self.data['high'].iloc[self.current_step].item()
-        current_price_low = self.data['low'].iloc[self.current_step].item()
+        current_mask = self.get_action_mask()
+        if not current_mask[action]:
+            # INVALID ACTION - stay in same market state, penalize
+            reward = -10
+            done = False
+            truncated = False
+            obs = self._get_obs()
+            return obs, reward, done, truncated, self.history[-1]
 
-        previous_state = self.broker.get_state()
+        broker_previous_state = self.broker.get_state()
 
         # Calculate SL/TP only for LONG and SHORT actions
-        sl_price, tp_price = PivotSLTPCalculator.calculate_sl_tp(
-            data=self.data,
-            current_step=self.current_step,
-            entry_price=current_price,
-            direction=direction_action,
-            risk_reward_ratio=risk_reward_ratio,  # Use agent's choice
-            atr_multiplier=atr_multiplier         # Use agent's choice
-        ) if direction_action in [1, 2] else (None, None)
+        # Calculate before update the step so that we dont leak future data, use current step
+        sl_price, tp_price = None, None
+        if action in [1, 2]:
+            sl_price, tp_price = PivotSLTPCalculator.calculate_sl_tp(
+                data=self.data,
+                current_step=self.current_step,
+                entry_price=self.data.iloc[self.current_step]['close'],
+                direction=action,
+                risk_reward_ratio=risk_reward_ratio,  # Use agent's choice
+                atr_multiplier=atr_multiplier         # Use agent's choice
+            )
+
+        # Increase next step
+        self.current_step += 1
+        next_candle = self.data.iloc[self.current_step][['close', 'open', 'high', 'low']]
 
         # Pass action directly to broker - it handles the logic
-        # Actions: 0=HOLD, 1=LONG, 2=SHORT, 3=CLOSE
+        # Actions: 0=HOLD, 1=LONG, 2=SHORT
         self.broker.step(
             step_index=self.current_step,
-            signal=direction_action,
-            close=current_price,
-            high=current_price_high,
-            low=current_price_low,
+            signal=action,
+            new_state=next_candle,
             tp_price=tp_price,
             sl_price=sl_price
         )
 
-        current_state = self.broker.get_state()
-
-        reward = self.calculate_reward(direction_action, current_state, previous_state)
+        # Calculate reward based on state transition
+        reward = self.calculate_reward(action, broker_previous_state)
 
         done = False
         truncated = False
         if self.broker.is_bankrupt:
             print("Account bankrupt!")
             done = True
-            # Bankruptcy penalty already applied in calculate_reward() - don't double penalize
+            reward = -1.0
+
+        truncated = self.current_step >= len(self.data) - 1 if truncated is False else truncated
 
         self.history.append({
             "step": self.current_step,
@@ -251,9 +278,6 @@ class SimpleTradingEnv(gym.Env):
             "truncated": truncated,
             **self.broker.get_state()
         })
-
-        self.current_step += 1
-        truncated = self.current_step >= len(self.data) - 1 if truncated is False else truncated
 
         obs = self._get_obs()
         return obs, reward, done, truncated, self.history[-1]
@@ -337,7 +361,7 @@ class SimpleTradingEnv(gym.Env):
             'vp_levels': vp_levels,
         }
 
-        for key, array in obs_dict.items():
+        """ for key, array in obs_dict.items():
             if np.isnan(array).any() or np.isinf(array).any():
                 raise ValueError(f"NaN/Inf detected in observation array '{key}'.")
 
@@ -355,92 +379,96 @@ class SimpleTradingEnv(gym.Env):
                 max_idx = np.where(array == array_max)[0].tolist()
                 print(f"Warning: Values outside [{expected_min}, {expected_max}] in '{key}' at step {self.current_step}:")
                 print(f"  min={array_min:.4f} at indices {min_idx[:5]}{'...' if len(min_idx) > 5 else ''}")
-                print(f"  max={array_max:.4f} at indices {max_idx[:5]}{'...' if len(max_idx) > 5 else ''}")
+                print(f"  max={array_max:.4f} at indices {max_idx[:5]}{'...' if len(max_idx) > 5 else ''}") """
 
         return obs_dict
 
-    def calculate_reward(self, action, current_state, previous_state):
-        """
-        REWARD FUNCTION v37 - SIMPLIFIED FOR STABLE LEARNING
-
-        Focus on what matters:
-        1. Make profitable trades (80%)
-        2. Don't go bankrupt (10%)
-        3. Don't do invalid actions (10%)
-
-        Removed:
-        - Constant HOLD penalty (kills exploration)
-        - Performance metrics (too sparse early in training)
-        - Trade close bonus (redundant with PnL)
-
-        Expected range per step: [-1.0, +1.0]
-        Expected range per episode: More balanced around 0 for random policy
-        """
+    def calculate_reward(self, action: int, previous_state):
         if previous_state is None:
             return 0.0
 
-        current_balance = current_state.get('equity', 0)
-        previous_balance = previous_state.get('equity', 0)
-        current_position = current_state.get('position_size', 0)
+        # Check for completed trades first (highest priority)
+        trade_history = self.broker.trade_history
+        current_step = self.broker.current_step
+        for trade in reversed(trade_history):
+            if trade.get('status') == 'CLOSED' and trade.get('step_close') == current_step:
+                trade_len = trade.get('step_close') - trade.get('step_open')
+                self.last_open_traded_step = trade.get('step_close')
+                if trade.get('reason') == 'TP':
+                    # Normalize: +1.0 base reward, bonus for quick trades
+                    reward = 1.0 + min(0.5, 20 / trade_len if trade_len > 0 else 0.5)
+                    return np.clip(reward, -2.0, 2.0)
+                elif trade.get('reason') == 'SL':
+                    # Normalize: -0.5 penalty (less severe than TP reward)
+                    return np.clip(-0.5, -2.0, 2.0)
+
+        # Action-based rewards (normalized to similar scale)
+        if action == 0:  # HOLD
+            if previous_state.get('position_size') != 0:
+                # Neutral - agent has no choice but to hold when in position
+                return 0.0
+            else:
+                # Neutral for holding when flat
+                return 0.0
+        
+        elif action in [1, 2]:  # LONG/SHORT
+            # Small positive for taking action (exploration)
+            return 0.05
+
+        return np.clip(0.0, -2.0, 2.0)
+
+    def calculate_reward2(self, action: int, previous_state):
+        if previous_state is None:
+            return 0.0
+
+        current_state = self.broker.get_state()
+        reward = 0.0
         previous_position = previous_state.get('position_size', 0)
-        current_step_on_trade = current_state.get('trade_step', 0)
+        current_position = current_state.get('position_size', 0)
+        cash_used = previous_state.get('used_balance', 1)
 
-        # ========================================
-        # COMPONENT 1: PnL Change (80% weight)
-        # ========================================
-        # Reward every profitable action, penalize every loss
-        balance_change = current_balance - previous_balance
-        balance_change_pct = balance_change / self.initial_balance
+        # BANKRUPTCY
+        if self.broker.is_bankrupt:
+            return -1.0
 
-        # Improved scaling: $100 profit on $10k = 1% = tanh(1.0) = 0.76 reward (stronger signal)
-        pnl_component = float(np.tanh(balance_change_pct * 100))
+        # Check trade history for open/close at current step
+        trade_history = self.broker.trade_history
+        open_reward = 0.0
+        close_reward = 0.0
+        current_step = self.broker.current_step
 
-        # Close trade reward based on realized PnL ratio
-        if current_state.get('traded') and previous_position != 0:
-            ratio = current_state.get('realized_pnl') / previous_state.get('used_balance')
-            pnl_component = np.tan(ratio)
+        # Find trades opened and/or closed at this step
+        for trade in reversed(trade_history):
+            if trade.get('status') == 'CLOSED' and trade.get('step_close') == current_step:
+                pnl = trade.get('pnl', 0)
+                used_balance = trade.get('position_value', cash_used)
+                pnl_percentage = (pnl / used_balance) * 100 if used_balance else 0
+                if pnl > 0:
+                    close_reward = 0.5 * np.tanh(pnl_percentage / 5.0)
+                else:
+                    close_reward = -0.25 * np.tanh(abs(pnl_percentage) / 5.0)
+                break  # Only reward for the most recent close
+        for trade in reversed(trade_history):
+            if trade.get('status') == 'OPEN' and trade.get('step_open') == current_step:
+                open_reward = 0.4
+                break  # Only reward for the most recent open
 
-        # Reward for holding winnig trades
-        if 10 > current_step_on_trade < 30:
-            pnl_component += np.tan(pnl_component * 1.2) * 0.1
-
-        # ========================================
-        # COMPONENT 2: Bankruptcy Penalty (10% weight)
-        # ========================================
-        equity_ratio = current_balance / self.initial_balance
-        if equity_ratio < 0.8:
-            bankruptcy_component = -float(np.tanh((0.8 - equity_ratio) * 5))
+        # If both open and close happened, sum both rewards
+        if open_reward or close_reward:
+            reward = open_reward + close_reward
+        # If only position opened
+        elif action in [1, 2] and previous_position == 0:
+            reward = 0.4
+        # If only position closed
+        elif close_reward:
+            reward = close_reward
+        # In position - unrealized PnL
+        elif current_position != 0:
+            unrealized_pnl = current_state.get('unrealized_pnl', 0)
+            unrealized_pct = (unrealized_pnl / cash_used) * 100 if cash_used else 0
+            reward = np.tanh(unrealized_pct / 10.0) * 0.2
+        # Holding penalty
         else:
-            bankruptcy_component = 0.0
+            reward = -0.01
 
-        # ========================================
-        # COMPONENT 3: Action Validity (10% weight)
-        # ========================================
-        validity_component = 0.0
-
-        # Valid Open
-        if action in [1, 2] and previous_position == 0:
-            validity_component = 1.0
-
-        # Valid Close
-        if action == 3 and previous_position != 0:
-            validity_component = 1.0
-
-        # Trying to close with no position
-        if action == 3 and previous_position == 0:
-            validity_component = -1.0
-
-        # Trying to open new position while already in one
-        if action in [1, 2] and previous_position != 0:
-            validity_component = -1.0
-
-        # ========================================
-        # WEIGHTED COMBINATION
-        # ========================================
-        reward = (
-            0.80 * pnl_component +
-            0.10 * bankruptcy_component +
-            0.10 * validity_component
-        )
-
-        return reward
+        return float(np.clip(reward, -1.0, 1.0))
